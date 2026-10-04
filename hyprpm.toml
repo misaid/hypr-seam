@@ -1,0 +1,8 @@
+[hypr-seam]
+output = "hypr-seam.so"
+
+[hypr-seam.build]
+build_script = """
+make all
+cp build/libhypr-seam.so ./hypr-seam.so
+"""
