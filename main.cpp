@@ -11,6 +11,7 @@
 #include "SeamConfig.hpp"
 #include "SeamRuleStore.hpp"
 #include "SeamState.hpp"
+#include "SeamHook.hpp"
 
 // Do NOT change this function.
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -180,10 +181,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return {};
     });
 
+    // Task 6 spike: log-only hook on Render::IElementRenderer::drawSurface.
+    // On failure install() has already shown a notification; the plugin stays
+    // loaded but inert for rendering.
+    SeamHook::install();
+
     HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Initialized successfully!", CHyprColor{0.2, 1.0, 0.2, 1.0}, 5000);
 
     return {"hypr-seam", "Per-corner window rounding with a book-seam adjacency flag.", "you", "0.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    SeamHook::remove();
 }
