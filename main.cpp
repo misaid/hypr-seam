@@ -4,10 +4,13 @@
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/event/EventBus.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
 
 #include "globals.hpp"
 #include "SeamConfig.hpp"
 #include "SeamRuleStore.hpp"
+#include "SeamState.hpp"
 
 // Do NOT change this function.
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -116,6 +119,49 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // and re-check the rounding guard on reloaded (after the new values land).
     static auto PRERELOAD = Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); });
     static auto PRELOADED = Event::bus()->m_events.config.reloaded.listen([]() { checkNativeRoundingIsZero(); });
+
+    // Window tracking + adjacency recompute triggers (Task 5).
+    //
+    // Event names below were confirmed against the installed
+    // <hyprland/src/event/EventBus.hpp> rather than trusted from the plan verbatim:
+    //   - window.open / window.close: exist exactly as named.
+    //   - window.move / window.changeFloatingMode / window.fullscreen /
+    //     workspace.active: "window.move" does NOT exist (there is no standalone
+    //     window-move/resize event at all); "changeFloatingMode" doesn't exist
+    //     either — the real member is "window.floating". "window.fullscreen" and
+    //     "workspace.active" exist exactly as named.
+    //   - monitor add/remove/move: real members are monitor.added, monitor.removed,
+    //     monitor.layoutChanged (used here for monitor rearrangement/"move").
+    // For the missing window-move/resize event, we follow the plan's documented
+    // fallback: recompute from a general per-tick callback, gated by a cheap dirty
+    // check (SeamState::onTick()) so idle ticks stay nearly free.
+    static auto PWINOPEN     = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); });
+    static auto PWINCLOSE    = Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); });
+    static auto PWINFLOAT    = Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); });
+    static auto PWINFULL     = Event::bus()->m_events.window.fullscreen.listen([](PHLWINDOW) { SeamState::recomputeAll(); });
+    static auto PWINMOVEWS   = Event::bus()->m_events.window.moveToWorkspace.listen([](PHLWINDOW, PHLWORKSPACE) { SeamState::recomputeAll(); });
+    static auto PWORKSPACE   = Event::bus()->m_events.workspace.active.listen([](PHLWORKSPACE) { SeamState::recomputeAll(); });
+    static auto PMONADDED    = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { SeamState::recomputeAll(); });
+    static auto PMONREMOVED  = Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR) { SeamState::recomputeAll(); });
+    static auto PMONLAYOUT   = Event::bus()->m_events.monitor.layoutChanged.listen([]() { SeamState::recomputeAll(); });
+    static auto PTICK        = Event::bus()->m_events.tick.listen([]() { SeamState::onTick(); });
+
+    // Attach to every window already open at load time (the plugin can be
+    // hot-loaded into a running session with windows already present).
+    for (auto& w : Desktop::windowState()->windows()) {
+        if (!validMapped(w) || w->isHidden())
+            continue;
+        SeamState::onWindowOpened(w);
+    }
+
+    // Debug-only: lets us confirm the tracking/adjacency/animation state machine
+    // works before Task 7 adds the real render hook. Kept (rather than removed)
+    // per the task brief's option to leave it documented as debug-only; safe to
+    // delete once Task 7 lands and there's a visual way to check this instead.
+    HyprlandAPI::addDispatcherV2(PHANDLE, "seam:debugstate", [](std::string) -> SDispatchResult {
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + SeamState::debugDump(), CHyprColor{0.4, 0.7, 1.0, 1.0}, 8000);
+        return {};
+    });
 
     HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Initialized successfully!", CHyprColor{0.2, 1.0, 0.2, 1.0}, 5000);
 
