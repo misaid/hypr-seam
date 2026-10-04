@@ -118,7 +118,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // ones forever. Clear on preReload (before Hyprlang re-runs the keyword lines),
     // and re-check the rounding guard on reloaded (after the new values land).
     static auto PRERELOAD = Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); });
-    static auto PRELOADED = Event::bus()->m_events.config.reloaded.listen([]() { checkNativeRoundingIsZero(); });
+    // Also recompute on full config reload (e.g. `hyprctl reload` after editing
+    // seamrule lines, radii, or plugin:seam:enabled in the config file) — without
+    // this, a reload leaves every tracked window's corners stale until some
+    // unrelated geometry/workspace/monitor event happens to fire.
+    static auto PRELOADED = Event::bus()->m_events.config.reloaded.listen([]() {
+        checkNativeRoundingIsZero();
+        SeamState::recomputeAll();
+    });
+    // config.props_refreshed's exact trigger conditions aren't documented in the
+    // installed EventBus.hpp beyond its name and `Event<const bool>` signature.
+    // Wired as a defensive extra alongside the guaranteed `reloaded` path above,
+    // in case some config-value change path fires it without a full reload —
+    // but verified empirically (fix-round-1 manual testing) that it does NOT
+    // fire for a plain `hyprctl keyword plugin:seam:... <value>` set, so that
+    // path still relies on an explicit window/workspace/monitor event or a full
+    // `hyprctl reload` to pick up the new value; this listener is cheap and
+    // harmless to keep regardless, in case other config-change paths do fire it.
+    static auto PPROPSREFRESHED = Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); });
 
     // Window tracking + adjacency recompute triggers (Task 5).
     //

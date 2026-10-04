@@ -18,9 +18,12 @@ namespace SeamState {
     // Recomputes adjacency + resolved config for every tracked window and retargets
     // its animated corner radii accordingly. Called on every event that can change
     // which corners touch a neighbor: window open/close/floating-toggle/fullscreen,
-    // workspace change, monitor add/remove/layout change, and (via the tick-gated
-    // fallback in main.cpp, since Hyprland has no standalone window-move/resize
-    // event) whenever a tracked window's position/size actually changed.
+    // workspace change, monitor add/remove/layout change, config reload, and (via
+    // the tick-gated fallback in main.cpp, since Hyprland has no standalone
+    // window-move/resize event) whenever a tracked window's position/size actually
+    // changed. Judges adjacency against each window's GOAL geometry, not its live
+    // animated position, so a recompute that happens to fire mid-animation still
+    // judges against the final, settled layout rather than a transient frame.
     void recomputeAll();
 
     // Per-window live corner radii, read every frame by the render hook (Task 7).
@@ -33,9 +36,14 @@ namespace SeamState {
     // Hyprland's event bus has no standalone "window moved/resized" event (confirmed
     // against the installed EventBus.hpp — only open/close/floating/fullscreen/
     // moveToWorkspace exist for windows). Call this from a `tick` listener in
-    // main.cpp; it cheaply fingerprints every mapped window's position/size/floating
-    // state and only runs the full recomputeAll() when that fingerprint changed
-    // since the last call, so idle ticks are nearly free.
+    // main.cpp; it cheaply fingerprints every mapped window's GOAL position/size/
+    // floating state and only runs the full recomputeAll() when that fingerprint
+    // changed since the last call. Note: `tick` is not a continuous per-frame
+    // heartbeat (confirmed empirically) — it fires in bursts while the compositor
+    // is actively rendering and goes silent once idle, so this is a best-effort
+    // catch-all, not a guaranteed poll; recomputeAll()'s own use of GOAL geometry
+    // (rather than relying on a trailing tick to "settle" the result) is what
+    // actually keeps the result correct regardless of when this fires.
     void onTick();
 
     // Debug-only: dumps every tracked window's live corner radii and touching state
