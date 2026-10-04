@@ -62,8 +62,8 @@ bool SeamHook::install() {
     void*      target = nullptr;
     for (const auto& m : matches) {
         Log::logger->log(Log::DEBUG, "[hypr-seam] drawSurface candidate: {} @ {}", m.demangled, m.address);
-        // findFunctionsByName is a substring match: it also returns preDrawSurface
-        // (and could return others in future), so pick only the exact demangled form.
+        // On 0.56.2 only drawSurface itself was returned (not preDrawSurface), but
+        // match the exact demangled form anyway in case future versions differ.
         if (m.demangled == TARGET_DEMANGLED) {
             if (target) {
                 Log::logger->log(Log::ERR, "[hypr-seam] multiple exact drawSurface matches, refusing to hook");

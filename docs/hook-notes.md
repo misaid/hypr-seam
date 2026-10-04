@@ -93,27 +93,103 @@ From `CSurfacePassElement::SRenderData` (`src/render/pass/SurfacePassElement.hpp
 `texture`. The hook fires for **every** surface: windows, subsurfaces and popups
 (`mainSurface == false` / `popup == true`), and layer surfaces (`pWindow` null, `pLS` set).
 Task 7 must filter on `pWindow && mainSurface && !popup`, or whatever policy it settles on.
+(Only main window surfaces were observed in testing. Popup, subsurface and layer firing is inferred
+from the source: `drawElement` routes every `EK_SURFACE` here. Filtering out subsurfaces means
+subsurfaces such as video or GL child surfaces that reach the window corners keep square corners.)
+`element.get()` is valid only for the duration of that one hook call; never store it.
 
-## GL scissor / clip primitive
+## GL scissor / clip primitive, and how to actually clip the window draw
 
-- Header: `/usr/include/hyprland/src/render/OpenGL.hpp`, class `Render::GL::CHyprOpenGLImpl`
-  (public section). Global instance: `Render::GL::g_pHyprOpenGL` (`inline UP<CHyprOpenGLImpl>`).
+Source checked: the v0.56.2 tag files at commit `efb50993780079460b0cbed1363e2166a2de1d9f`
+(`src/render/ElementRenderer.cpp`, `src/render/OpenGL.cpp`, `src/render/GLRenderer.cpp`,
+`src/render/gl/GLElementRenderer.cpp`, `src/render/pass/SurfacePassElement.cpp`), fetched from
+`raw.githubusercontent.com/hyprwm/Hyprland/<commit>/...`. Upstream `main` was not used. Line numbers
+below refer to those files.
 
-  ```cpp
-  void scissor(const CBox&, bool transform = true);
-  void scissor(const pixman_box32*, bool transform = true);
-  void scissor(const int x, const int y, const int w, const int h, bool transform = true);
-  ```
+### The primitive
 
-- All three are exported from the binary (`nm -D`), so a plugin can link against them.
-- Reset/disable: `Render::IHyprRenderer::disableScissor()` (virtual, `src/render/Renderer.hpp`,
-  implemented by `Render::GL::CHyprGLRenderer::disableScissor()`), reached via `g_pHyprRenderer`.
-  `CHyprOpenGLImpl` also has a `CAP_STATUS_SCISSOR_TEST` cap tracked through `setCapStatus`.
-- `renderRoundedShadow(const CBox&, int round, float roundingPower, int range, ...)` sits in the same
-  class next to `renderRect` and `renderTexture`. The expected pattern is `scissor(box)` -> draw ->
-  `disableScissor()`. Whether `scissor(nullptr)` (the `pixman_box32*` overload) also disables
-  scissoring has not been checked, because only headers are installed. Task 7 should confirm this
-  against the upstream `OpenGL.cpp` for this tag before relying on it.
+- `Render::GL::CHyprOpenGLImpl::scissor(...)` (`OpenGL.hpp`, public; global
+  `Render::GL::g_pHyprOpenGL`). It has three overloads, `(const CBox&, bool transform = true)`,
+  `(const pixman_box32*, bool transform = true)` and `(int x, int y, int w, int h, bool transform = true)`.
+  All three are exported (`nm -D`).
+- `scissor(nullptr)` **does** disable scissoring: the `pixman_box32*` overload calls
+  `setCapStatus(GL_SCISSOR_TEST, false)` on null (OpenGL.cpp:1020-1026).
+  `g_pHyprRenderer->disableScissor()` is just `g_pHyprOpenGL->scissor(nullptr)` (GLRenderer.cpp:278-280).
+- `scissor(CBox)` caches the last box in a function-local static `m_lastScissorBox` and only calls
+  `glScissor` when the box changes (OpenGL.cpp:991-1018). Raw `glScissor` calls made outside this
+  function desync that cache, so always go through `scissor()`.
+
+### VERIFIED UNSAFE: wrapping `m_original` in an outer scissor
+
+Do **not** use `scissor(box)` -> `m_original(...)` -> `disableScissor()`. On 0.56.2 the original
+destroys any outer scissor state:
+
+- `drawSurface` (ElementRenderer.cpp:219-392) draws through
+  `drawElement(makeShared<CTexPassElement>(...))` -> `drawTex` -> `CGLElementRenderer::draw(CTexPassElement)`
+  -> `CHyprOpenGLImpl::renderTexture`.
+- `renderTextureInternal` calls `scissor(&RECT, ...)` once per damage or clip rectangle before each
+  `glDrawArrays` (OpenGL.cpp:1574-1595). Each call replaces our glScissor box.
+- `renderTexture` then ends with an unconditional `scissor(nullptr)` (OpenGL.cpp:1142), which turns
+  `GL_SCISSOR_TEST` off.
+- The blur path (`renderTextureWithBlurInternal`) also calls `scissor(nullptr)` at its start and end
+  (OpenGL.cpp:2017, 2138).
+
+An outer scissor would therefore be silently ignored, with no error. The scissor primitive is still
+useful **for Task 7's own draws** (e.g. a corner patch it renders itself after `m_original` returns),
+just never as a wrapper around the original.
+
+### VERIFIED NOT VIABLE: shrinking the `damage` parameter
+
+`drawSurface` **never reads its `damage` parameter.** Both texture draws pass
+`m_renderData.damage.copy().intersect(windowBox)` (ElementRenderer.cpp:327, 345, 367, 385), where
+`m_renderData` is `g_pHyprRenderer->m_renderData`. Passing a smaller `CRegion` to `m_original` has
+no effect.
+
+### Also not viable: editing `element->m_data.clipBox`
+
+`preDrawSurface` copies `element->m_data.clipBox` into `g_pHyprRenderer->m_renderData.clipBox`
+**before** calling `drawSurface` (ElementRenderer.cpp:396), which is before our hook runs. Changing
+the element's `clipBox` inside the hook does nothing. `CSurfacePassElement::visibleRegion()`, which
+produces the `clipRegion` that drawSurface forwards, ignores `clipBox` too (SurfacePassElement.cpp:139-179).
+`m_renderData.clipBox` is in any case a single `CBox` and cannot describe "window minus corners".
+
+### VIABLE levers (all read by the original *during* the call, so set them before and restore after)
+
+1. **`element->m_data.rounding` / `roundingPower` / `dontRound`: viable, single radius only.**
+   drawSurface reads these from `element->m_data` at ElementRenderer.cpp:285-293
+   (`rounding = m_data.rounding - 1`, forced to 0 if `dontRound`) and passes them to the rounded
+   texture shader as `.round` / `.roundingPower`. Writing them through `element.get()->m_data`
+   before calling through works. The shader applies one radius to all four corners. Pass elements
+   are rebuilt every frame, so the edit only affects that one draw. Note that `rounding <= 0` lets
+   Hyprland disable blending for opaque windows (`CANDISABLEBLEND`, line 296).
+
+2. **`g_pHyprRenderer->m_renderData.damage` (public `CRegion`, `render/types.hpp`): viable as a
+   region mask, with one caveat.** This global is the actual source of the damage drawSurface draws
+   into. Save it, subtract the four corner boxes (in monitor-local *scaled* pixels, the same space
+   as `windowBox`), call `m_original`, then **restore it unconditionally** (scope guard). Later
+   elements in the pass rely on it. The blur path also reads it (OpenGL.cpp:2031) and the render
+   pass reuses it afterwards. Caveat: when `m_renderData.clipBox` or the surface's `clipRegion`
+   (from `visibleRegion()`) is non-empty, `renderTextureInternal` draws per rectangle of
+   `clipBox ∩ clipRegion` and **does not intersect with damage** (OpenGL.cpp:1574-1589). In that
+   case a damage-only mask is bypassed. To cover it, Task 7 must also narrow
+   `g_pHyprRenderer->m_renderData.clipBox`, which the hook *can* still change because preDrawSurface
+   set it before the call. That only works to a single box, so it cannot remove corners. For such
+   surfaces Task 7 must either accept the gap or skip them and keep native behaviour. Excluded
+   corner pixels show whatever is already in the framebuffer, i.e. what lies behind the window,
+   because the pass draws back to front.
+
+3. **Recommended Task 7 composition, using levers 1 and 2:** call `m_original` once with
+   `m_data.rounding = 0`/`dontRound = true` and `m_renderData.damage` minus the 4 corner boxes. Then,
+   for each corner, draw the window texture again yourself with
+   `g_pHyprOpenGL->renderTexture(m_data.texture, windowBox, {.damage = &cornerRegion, .round = r_corner, .roundingPower = p, ...})`,
+   where `cornerRegion = savedDamage ∩ cornerBox`. A single-radius rounded draw restricted to one
+   corner's box gives per-corner radii with Hyprland's own shader and no custom shader. This needs
+   the same `windowBox` / UV setup drawSurface computes (`getTexBox()` scaled and rounded, plus
+   `primarySurfaceUVTopLeft/BottomRight`). drawSurface **resets those UVs to (-1,-1) on exit**
+   (scope guard at lines 223-226), so Task 7 must recompute or capture them, not read them after
+   the call. That part is unverified and is Task 7's job.
+   Do **not** call `m_original` several times per frame instead. Each call has side effects:
+   `presentFeedback` (line 390-391), `discard()`, blur framebuffer work, and the blend toggle.
 
 ## Verification transcript (summary)
 
