@@ -1,7 +1,10 @@
 # hypr-seam — Design Spec
 
 Date: 2026-10-04
-Status: Draft, pending user review
+Status: Draft, pending user review. Rendering Mechanism revised same day after
+discovering the overlay-decoration approach cannot correctly handle a dynamic
+backdrop (live/video wallpaper); see that section for the hook-based
+replacement.
 
 ## Overview
 
@@ -33,14 +36,19 @@ features on top of that:
 
 ## Non-goals (current scope)
 
-- Border-pass and shadow-pass rounding. The user's config currently runs
-  `border_size = 0` and `shadow:enabled = false`, so neither pass needs
-  per-corner treatment. If borders or shadows are re-enabled later, this is
-  a follow-up, not part of this spec.
+- Border-pass rounding. The user's config currently runs `border_size = 0`.
+  Re-enabling borders later is a straightforward follow-up of the same
+  shape as the content-pass work in this spec (hook the border draw call,
+  scissor-exclude the 4 corners, redraw them as a per-corner ring/annulus)
+  — not an open question, just not built in v1.
+- Shadow-pass rounding. Shadows are disabled (`shadow:enabled = false`).
+  Same status as borders: deferred, not blocked.
 - Blur-aware corner compositing. Blur is currently disabled
-  (`decoration:blur:enabled = false`). With blur off, the corner patch only
-  ever needs to redraw plain wallpaper, not a blurred backdrop. See
-  "Rendering Mechanism" for what changes if blur is re-enabled later.
+  (`decoration:blur:enabled = false`). The chosen rendering mechanism
+  (see below) reads the window's already-computed blurred backdrop texture
+  from the same internal call it hooks, so re-enabling blur later requires
+  no new sourcing logic — it's one extra texture read already in scope at
+  the hook site, not an open technical unknown.
 
 ## Terminology
 
@@ -66,6 +74,9 @@ Global config values (`addConfigValueV2`, prefix `plugin:seam:`):
 | `plugin:seam:enabled` | bool | `false` | Global seam master switch. |
 | `plugin:seam:seam_radius` | int | `2` | Radius a flagged corner collapses to. |
 | `plugin:seam:tolerance` | int | `6` (px) | Max pixel gap between two edges still considered "touching." Covers `gaps_in` plus float/scale slop. |
+| `plugin:seam:animate` | bool | `true` | Eases a corner's radius between base and seam values instead of snapping. |
+| `plugin:seam:animation_speed` | float | `300` (ms) | Duration of the easing transition. |
+| `plugin:seam:animation_curve` | string | `"default"` | Name of a bezier curve already registered via Hyprland's `bezier =` / `hl.curve(...)`. |
 
 Per-app rules via a new config keyword `seamrule`, parsed by the plugin
 itself (Hyprland's plugin API has no hook into the native `windowrulev2`
@@ -129,32 +140,81 @@ corner rendering for every window it manages, computed once and shared by
 both the base-rounding and seam features (seam is just a corner-radius
 override feeding the same renderer, not a separate code path).
 
-Mechanism: a custom per-window decoration (`addWindowDecoration`, same
-public-API pattern as the official `borders-plus-plus` plugin) pushes its
-own render-pass element after Hyprland draws that window's square content.
-For each of the 4 corners, the element draws a small patch sized to that
-corner's resolved radius, compositing:
+**Why an overlay decoration doesn't work:** an earlier version of this
+design drew the per-corner patches as a separate decoration render-pass
+element running *after* Hyprland painted the window's square content.
+Hyprland composites back-to-front (background/layers, then windows) into a
+single framebuffer; native rounding looks correct because the window's own
+shader `discard`s the corner fragments, leaving whatever was painted a
+moment earlier in that same frame untouched. A later, separate overlay
+pass has no such luck — by the time it runs, the opaque square content has
+already overwritten the real backdrop at that pixel, so there is nothing
+correct left to reveal. This is a problem independent of blur: with a live
+wallpaper (a layer-shell client rendering its own animated content,
+distinct from Hyprland's static `getBackground()` fallback), the real
+backdrop changes every frame, so there is no static texture an overlay
+pass could substitute in its place either.
 
-- **Inside** the corner's squircle curve (SDF using `rounding_power`,
-  matching Hyprland's native look): keep the window's own already-painted
-  content.
-- **Outside** the curve: **redraw** the correct backdrop — do not simply
-  write alpha 0. Hyprland paints back-to-front (wallpaper, then windows);
-  by the time our pass runs, the window has already been painted fully
-  opaque and square over the real backdrop pixels, so a naive transparency
-  punch would not "reveal" anything — the correct pixels are already gone.
-  Instead, the patch samples the monitor's wallpaper texture (public
-  `getBackground()` accessor) and paints it directly into the
-  outside-curve region, blending at the SDF edge for anti-aliasing.
+**Chosen mechanism:** hook the internal call Hyprland uses to paint a
+managed window's opaque content (`createFunctionHook`, the same public,
+plugin-facing trampoline-hook facility used by existing community plugins
+such as `hy3` — this requires no Hyprland source patch or custom build).
+Inside the hook, for each of the window's 4 corners:
 
-**If blur is re-enabled later:** this patch would additionally need to
-sample the same pre-blurred monitor backdrop Hyprland computes once per
-frame (via its `PreBlurElement` pass) for the outside-curve region of any
-window with blur active, instead of plain wallpaper. Whether that shared
-blurred texture remains valid/sampleable from a later, separate pass is an
-open unknown that would need prototyping at that time, with a safe fallback
-of plain wallpaper (no blur) if it isn't reusable. Out of scope while blur
-stays disabled.
+1. **Scissor-exclude** that corner's small box from the native paint call,
+   so the native square content is never drawn there in the first place.
+2. **Redraw that box ourselves**, using the plugin's own GLSL shader (the
+   native shader has no per-corner radius uniform, so this can't be a
+   tweak to it — it's a small shader of our own): inside the corner's
+   squircle SDF curve (same `rounding_power` exponent as native, for a
+   matching look), sample the window's own content texture, identical to
+   what the native call would have painted there. Outside the curve,
+   write nothing — since step 1 already excluded the native paint from
+   this box, whatever was already in the framebuffer from the preceding
+   background/layer pass (live wallpaper included) is still correct and
+   untouched, automatically, with no special-casing per backdrop type.
+
+Because this runs at the exact point in frame order where the native
+paint would have happened — not in a separate later pass — it inherits
+Hyprland's own "don't touch pixels you don't need to" correctness for
+free, for any backdrop.
+
+**Blur, if re-enabled later:** falls out of the same mechanism almost for
+free. The hook point sits inside the same internal call where Hyprland has
+already computed that window's blurred backdrop texture for this frame
+(available as a local value in scope, not something we'd fetch or
+snapshot separately). For a window with blur enabled, the "outside the
+curve" fragments would sample that texture instead of being left
+untouched; for a window without blur, they stay untouched as described
+above. Not built in v1 (blur is currently disabled), but no new sourcing
+logic would be needed to add it.
+
+**Animation:** each corner's radius is a `PHLANIMVAR<float>` (Hyprland's
+shared animated-variable type, the same mechanism driving native
+window-move/fade/border-color animations) bound directly to the window
+(`Animation::mgr()->createAnimation(v, pav, pConfig, pWindow,
+AVARDAMAGE_ENTIRE)` — the overload that takes a window with no decoration
+object, since this design has no decoration). The corner shader reads each
+animated variable's current eased value every time the hook fires. When
+adjacency recompute changes a corner's target (base ↔ `seam_radius`), the
+plugin retargets the animated variable; Hyprland's animation manager
+handles easing and schedules the repeated repaints (and therefore repeated
+hook firings) needed to animate it, using the curve/speed named by
+`plugin:seam:animation_curve` / `plugin:seam:animation_speed`, or snapping
+immediately if `plugin:seam:animate = false`.
+
+## Known Risks
+
+- **Hooks internal, version-unstable Hyprland functions.** `PluginAPI.hpp`
+  is explicit that `createFunctionHook` targets are "not guaranteed any
+  API stability" — unlike the public config/window-rule/decoration APIs
+  used elsewhere in this plugin. This plugin is pinned to the Hyprland
+  0.56.2 internal ABI it was built against; a future Hyprland release that
+  changes the hooked function's signature or removes it will require a
+  matching plugin update, not just a recompile. This is a deliberate,
+  accepted trade-off: the alternative (a pure overlay decoration) cannot
+  correctly handle a dynamic backdrop at all, which is a worse failure
+  mode than "needs an update after a Hyprland upgrade."
 
 ## Error Handling & Edge Cases
 
@@ -178,7 +238,10 @@ stays disabled.
   4-way split (X-junction), 3-way T-split, single window alone (seam never
   fires), a floating window next to a tiled window (neither affects the
   other), asymmetric per-app rule applied to a matched app, resize/drag
-  live, open/close windows rapidly.
+  live, open/close windows rapidly, **a live/video wallpaper visible
+  correctly through a flattened corner with no stale or wrong texture**,
+  and the seam/base-radius transition visibly easing rather than snapping
+  when `plugin:seam:animate = true`.
 - A small headless unit test (plain C++, no Hyprland runtime) for the pure
   adjacency-detection function, since that logic is decoupled from
   rendering and easy to test in isolation with fabricated window boxes.
@@ -186,5 +249,7 @@ stays disabled.
 ## Out of Scope / Deferred
 
 - Border-pass and shadow-pass per-corner rounding (both features disabled
-  in current config).
-- Blur-aware corner compositing (blur currently disabled).
+  in current config; same hook-and-redraw pattern as the content pass when
+  built).
+- Blur-aware corner compositing (blur currently disabled; same hook site
+  already has the blurred texture in scope when built).
