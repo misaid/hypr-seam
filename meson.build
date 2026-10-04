@@ -7,6 +7,8 @@ pixman = dependency('pixman-1')
 
 sources = [
   'main.cpp',
+  'SeamConfig.cpp',
+  'SeamRuleStore.cpp',
 ]
 
 shared_module('hypr-seam', sources,
