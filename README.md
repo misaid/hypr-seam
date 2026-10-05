@@ -14,11 +14,7 @@ being flattened or as a neighbor that causes another window to flatten.
 
 ## Demo
 
-![Placeholder illustration of the seam effect: four colored windows in a 2x2 grid, outer corners rounded, corners facing each other flattened](docs/images/demo-placeholder.png)
-<!-- TODO: replace with a real demo screenshot or GIF of the plugin running in Hyprland -->
-
-This is a generated placeholder, not a screenshot of the plugin running. A
-real demo screenshot or GIF is still needed.
+<!-- TODO: add a real demo screenshot or GIF of the plugin running in Hyprland -->
 
 ## Requirements
 
