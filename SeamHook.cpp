@@ -31,8 +31,13 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/desktop/view/types/GeometricMovableAnimated.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/macros.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -75,6 +80,73 @@ namespace {
         const double y = top ? windowBox.y : windowBox.y + windowBox.height - r;
 
         return SCornerPatch{CBox{x, y, r, r}, static_cast<int>(std::lround(r))};
+    }
+
+    // Fix round 1: our own renderTexture() calls for the 4 corner patches never set
+    // allowCustomUV (nor a matching UV rect), so they always sample the plain default
+    // 0..1 UV quad. The main body's own paint (through callOriginal()) goes through
+    // IElementRenderer::calculateUVForSurface, which on some windows sets a REAL custom
+    // UV rect on the global g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft/
+    // BottomRight that CGLElementRenderer::draw(WP<CTexPassElement>) reads at the moment
+    // of that specific draw call. For those windows our corner patches would sample a
+    // different slice of the texture than the body immediately next to them — a visible
+    // seam exactly where we're trying to make a clean one.
+    //
+    // calculateUVForSurface itself is private and non-exported (not reachable from a
+    // plugin), and the "expected size" helper (getSurfaceExpectedSize) it depends on for
+    // one of its branches isn't in the installed headers at all (checked: it's not
+    // declared anywhere under /usr/include/hyprland), so that branch's exact trigger
+    // condition can't be safely re-derived here either — guessing at it would risk the
+    // same kind of silent mismatch this fix is trying to close. Instead, detect the
+    // cases we CAN cheaply and exactly replicate from public fields (both confirmed
+    // against the pinned 0.56.2 source, docs/hook-notes.md's own citation commit), plus
+    // one conservative heuristic backstop for the branch we can't replicate, and skip
+    // the entire per-corner mechanism for this window's frame when any of them trip —
+    // falling back to the plain, square-cornered callOriginal() draw, exactly like the
+    // existing clipBox fallback above. A window that skips this way keeps native (square)
+    // corners for that frame instead of risking a wrong-but-confident corner texture.
+    //
+    // 1. viewport.hasSource: the wp_viewporter protocol crops/scales the buffer via a
+    //    source rectangle — calculateUVForSurface maps UV to exactly that rectangle. Exact,
+    //    cheap, a public field.
+    // 2. MISALIGNEDFSV1: an exact replica of drawSurface's own boolean (ElementRenderer.cpp,
+    //    confirmed against the fetched 0.56.2 source) for the "fractional scale + legacy
+    //    wl_surface.set_buffer_scale(1) buffer is off by one-or-two physical pixels from the
+    //    window box" case, built from the same public fields drawSurface itself reads.
+    // 3. Backstop heuristic: if the surface's buffer size doesn't match our windowBox size
+    //    at all (beyond a few px of rounding slack) and neither of the above already caught
+    //    it, treat it as "possibly needs a custom UV we can't compute" and skip too. This
+    //    overapproximates the real "expected size ratio != 1" branch (errs toward skipping
+    //    more than strictly necessary), which is the safe direction to err in here.
+    bool surfaceNeedsCustomUV(const CSurfacePassElement::SRenderData& data, const CBox& windowBox) {
+        if (!data.surface)
+            return false;
+
+        const auto& surf = data.surface->m_current;
+
+        if (surf.viewport.hasSource)
+            return true;
+
+        const bool interactiveResizeInProgress =
+            data.pWindow && g_layoutManager->dragController()->target() && g_layoutManager->dragController()->mode() == MBIND_RESIZE;
+
+        const bool misalignedFSv1 = std::floor(data.pMonitor->m_scale) != data.pMonitor->m_scale && surf.scale == 1 && windowBox.size() != surf.bufferSize &&
+            DELTALESSTHAN(windowBox.width, surf.bufferSize.x, 3) && DELTALESSTHAN(windowBox.height, surf.bufferSize.y, 3) &&
+            (!data.pWindow || (!data.pWindow->sizeAnimation()->isBeingAnimated() && !interactiveResizeInProgress)) &&
+            (!data.pLS || (!data.pLS->sizeAnimation()->isBeingAnimated()));
+
+        if (misalignedFSv1)
+            return true;
+
+        // Backstop: any other buffer-size/windowBox-size mismatch beyond a few px of
+        // rounding slack. Deliberately coarser than DELTALESSTHAN's "off by one-or-two" —
+        // this is the catch-all for the expected-size/ratio branch we can't exactly
+        // replicate, so it's fine (safe, even) if it also re-catches cases already caught
+        // above.
+        if (std::abs(windowBox.width - surf.bufferSize.x) > 3 || std::abs(windowBox.height - surf.bufferSize.y) > 3)
+            return true;
+
+        return false;
     }
 
     void hkDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
@@ -135,6 +207,14 @@ namespace {
         windowBox.round();
 
         if (windowBox.width <= 1 || windowBox.height <= 1) {
+            callOriginal();
+            return;
+        }
+
+        // Fix round 1: our corner patches can't safely reproduce a custom UV mapping —
+        // see surfaceNeedsCustomUV's own comment. Skip entirely for this window's frame
+        // rather than guess at one.
+        if (surfaceNeedsCustomUV(data, windowBox)) {
             callOriginal();
             return;
         }
