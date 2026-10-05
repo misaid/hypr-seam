@@ -1,8 +1,20 @@
-[hypr-seam]
-output = "hypr-seam.so"
+# hyprpm manifest. Schema per hyprpm's own parser (hyprpm/src/core/Manifest.cpp,
+# MANIFEST_HYPRPM branch, Hyprland v0.56.2): a [repository] table, then one table per
+# plugin with `output` (path of the built .so, relative to the repo root) and `build`
+# (an array of shell commands, each run as `cd <repo> && <build env> <command>`).
+# Keep each step a single command: hyprpm prefixes its build environment (pointing
+# pkg-config at the matching Hyprland headers) onto each step, so a step chained with
+# `&&` would only give that environment to its first command.
+[repository]
+name = "hypr-seam"
+authors = ["misaid"]
+commit_pins = []
 
-[hypr-seam.build]
-build_script = """
-make all
-cp build/libhypr-seam.so ./hypr-seam.so
-"""
+[hypr-seam]
+description = "Per-corner window rounding with a book-seam adjacency flag."
+authors = ["misaid"]
+output = "hypr-seam.so"
+build = [
+    "make all",
+    "cp build/libhypr-seam.so hypr-seam.so",
+]
