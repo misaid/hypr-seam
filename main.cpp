@@ -6,6 +6,15 @@
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/config/ConfigManager.hpp>
+#include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/config/lua/ConfigManager.hpp>
+
+#include <lua.h>
+#include <lauxlib.h>
+
+#include <string>
+#include <vector>
 
 #include "globals.hpp"
 #include "SeamConfig.hpp"
@@ -28,6 +37,159 @@ static Hyprlang::CParseResult onSeamRule(const char* /*COMMAND*/, const char* VA
     else
         SeamRuleStore::add(rule);
     return result;
+}
+
+namespace {
+    // Every event-bus listener handle the plugin owns. Kept at namespace scope (not as
+    // function-local statics inside PLUGIN_INIT) so PLUGIN_EXIT can drop them: a listener
+    // is unregistered when its handle is destroyed, and a function-local static is only
+    // destroyed at DSO teardown — which may never happen promptly (or at all) on plugin
+    // unload, leaving callbacks into our state live after the plugin is gone.
+    std::vector<Hyprutils::Signal::CHyprSignalListener> g_listeners;
+
+    // Reads one rule-table field as a regex pattern string. Returns false (with `err` set)
+    // if present but not a string.
+    bool luaOptionalString(lua_State* L, int tableIdx, const char* field, std::string& out, std::string& err) {
+        lua_getfield(L, tableIdx, field);
+        bool ok = true;
+        if (lua_type(L, -1) == LUA_TSTRING)
+            out = lua_tostring(L, -1);
+        else if (!lua_isnil(L, -1)) {
+            err = std::string{"'"} + field + "' must be a string (a regex)";
+            ok  = false;
+        }
+        lua_pop(L, 1);
+        return ok;
+    }
+
+    // Parses the table form of hl.plugin.seam.rule:
+    //   { class = "<regex>", title = "<regex>", seam = <bool|0|1>, rounding = <n | {tl, tr, bl, br}> }
+    // At least one of class/title, and at least one of seam/rounding, is required. Produces
+    // one rule per directive given (so seam + rounding in one call yields two rules).
+    bool parseLuaRuleTable(lua_State* L, int idx, std::vector<SSeamRule>& out, std::string& err) {
+        SSeamRule base{};
+        if (!luaOptionalString(L, idx, "class", base.classPattern, err) || !luaOptionalString(L, idx, "title", base.titlePattern, err))
+            return false;
+        if (base.classPattern.empty() && base.titlePattern.empty()) {
+            err = "needs a non-empty 'class' and/or 'title' regex";
+            return false;
+        }
+
+        bool ok = true;
+
+        lua_getfield(L, idx, "rounding");
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            const double r = lua_tonumber(L, -1);
+            SSeamRule    rule = base;
+            rule.isSeamDirective = false;
+            rule.radii           = {r, r, r, r};
+            out.push_back(rule);
+        } else if (lua_type(L, -1) == LUA_TTABLE) {
+            double v[4];
+            for (int i = 0; i < 4 && ok; ++i) {
+                lua_rawgeti(L, -1, i + 1);
+                if (lua_type(L, -1) != LUA_TNUMBER)
+                    ok = false;
+                else
+                    v[i] = lua_tonumber(L, -1);
+                lua_pop(L, 1);
+            }
+            if (ok && lua_rawlen(L, -1) != 4)
+                ok = false;
+            if (!ok)
+                err = "'rounding' table must be exactly 4 numbers: { tl, tr, bl, br }";
+            else {
+                SSeamRule rule       = base;
+                rule.isSeamDirective = false;
+                rule.radii           = {v[0], v[1], v[2], v[3]};
+                out.push_back(rule);
+            }
+        } else if (!lua_isnil(L, -1)) {
+            err = "'rounding' must be a number or a table of 4 numbers";
+            ok  = false;
+        }
+        lua_pop(L, 1);
+        if (!ok)
+            return false;
+
+        lua_getfield(L, idx, "seam");
+        if (lua_type(L, -1) == LUA_TBOOLEAN || lua_type(L, -1) == LUA_TNUMBER) {
+            SSeamRule rule       = base;
+            rule.isSeamDirective = true;
+            rule.seamOn          = lua_type(L, -1) == LUA_TBOOLEAN ? lua_toboolean(L, -1) : lua_tonumber(L, -1) != 0;
+            out.push_back(rule);
+        } else if (!lua_isnil(L, -1)) {
+            err = "'seam' must be a boolean (or 0/1)";
+            ok  = false;
+        }
+        lua_pop(L, 1);
+        if (!ok)
+            return false;
+
+        if (out.empty()) {
+            err = "needs 'seam' and/or 'rounding'";
+            return false;
+        }
+        return true;
+    }
+
+    // Lua entry point for per-app rules under the Lua config manager, registered as
+    // hl.plugin.seam.rule. Accepts either the same string a hyprlang `seamrule = ...` line
+    // takes, or a table:
+    //   hl.plugin.seam.rule("seam 0, class:^(foot)$")
+    //   hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
+    //   hl.plugin.seam.rule({ title = "^Picture-in-Picture$", seam = false })
+    //
+    // Errors are reported the way Hyprland's own Lua bindings report config errors (added
+    // to the config error list, shown in the error bar) rather than by raising a Lua error:
+    // raising would abort the rest of the user's config file, and lua_error longjmps, which
+    // must never cross live C++ objects with destructors.
+    int luaSeamRule(lua_State* L) {
+        std::string            err;
+        std::vector<SSeamRule> parsed;
+
+        if (lua_type(L, 1) == LUA_TSTRING) {
+            SSeamRule rule;
+            if (parseSeamRuleLine(lua_tostring(L, 1), rule))
+                parsed.push_back(rule);
+            else
+                err = "malformed rule string (expected e.g. \"seam 0, class:^(foot)$\" or \"rounding 4 4 22 22, title:^(x)$\")";
+        } else if (lua_type(L, 1) == LUA_TTABLE)
+            parseLuaRuleTable(L, 1, parsed, err);
+        else
+            err = "expected a rule string or a table";
+
+        if (!err.empty()) {
+            luaL_where(L, 1);
+            std::string where = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            const std::string msg = where + "hl.plugin.seam.rule: " + err;
+            if (auto* mgr = Config::Lua::CConfigManager::fromLuaState(L))
+                mgr->addError(std::string{msg});
+            else
+                HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] " + msg, CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+            return 0;
+        }
+
+        for (const auto& r : parsed)
+            SeamRuleStore::add(r);
+        return 0;
+    }
+
+    // Lua-side twin of the `seam:debugstate` dispatcher, registered as
+    // hl.plugin.seam.debugstate. Under a Lua config, plugin dispatchers added with
+    // addDispatcherV2 aren't reachable from `hyprctl dispatch` (which becomes
+    // `hl.dispatch(<lua expr>)`), so this is the way to get the same diagnostic there:
+    //   hyprctl eval 'return hl.plugin.seam.debugstate()'
+    // Returns the dump as a string (and logs it, like the dispatcher).
+    int luaSeamDebugState(lua_State* L) {
+        {
+            const auto dump = SeamState::debugDump();
+            Log::logger->log(Log::INFO, "[hypr-seam debugstate]\n{}", dump);
+            lua_pushstring(L, dump.c_str());
+        }
+        return 1;
+    }
 }
 
 static void registerSeamConfig() {
@@ -57,7 +219,24 @@ static void registerSeamConfig() {
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.animationSpeed);
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.animationCurve);
 
-    HyprlandAPI::addConfigKeyword(PHANDLE, "seamrule", onSeamRule, Hyprlang::SHandlerOptions{});
+    // Per-app rules have two entry points, one per config flavour; both are always
+    // attempted (additive), but each API only succeeds under its own config manager:
+    // addConfigKeyword returns false unless Hyprland is running a legacy hyprlang .conf,
+    // and addLuaFunction returns false unless it's running a Lua config (both confirmed
+    // against the 0.56.2 PluginAPI.cpp). So only the one matching the active config
+    // manager is expected to succeed — complain if THAT one didn't.
+    const bool keywordOk = HyprlandAPI::addConfigKeyword(PHANDLE, "seamrule", onSeamRule, Hyprlang::SHandlerOptions{});
+    const bool luaOk     = HyprlandAPI::addLuaFunction(PHANDLE, "seam", "rule", luaSeamRule);
+    // Diagnostic only; not worth a notification if it fails (the dispatcher remains).
+    HyprlandAPI::addLuaFunction(PHANDLE, "seam", "debugstate", luaSeamDebugState);
+
+    const bool isLua = Config::mgr() && Config::mgr()->type() == Config::CONFIG_LUA;
+    if (isLua ? !luaOk : !keywordOk) {
+        HyprlandAPI::addNotification(PHANDLE,
+                                     isLua ? "[hypr-seam] Failed to register hl.plugin.seam.rule — per-app seam rules will not work (see hyprland.log)." :
+                                             "[hypr-seam] Failed to register the seamrule keyword — per-app seam rules will not work.",
+                                     CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+    }
 
     HyprlandAPI::reloadConfig();
 }
@@ -113,20 +292,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     registerSeamConfig();
     checkNativeRoundingIsZero();
 
-    // Hyprlang re-invokes the `seamrule` keyword handler for every matching line on
-    // each config reload, but never clears state our plugin owns (SeamRuleStore) —
-    // so without this, rules re-parsed on reload would simply append onto the old
-    // ones forever. Clear on preReload (before Hyprlang re-runs the keyword lines),
+    // Hyprlang re-invokes the `seamrule` keyword handler (and a Lua config re-runs its
+    // hl.plugin.seam.rule calls) for every rule on each config reload, but never
+    // clears state our plugin owns (SeamRuleStore) — so without this, rules
+    // re-parsed on reload would simply append onto the old ones forever. Clear on
+    // preReload (emitted by both config managers before the config is re-run),
     // and re-check the rounding guard on reloaded (after the new values land).
-    static auto PRERELOAD = Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); });
+    g_listeners.emplace_back(Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); }));
     // Also recompute on full config reload (e.g. `hyprctl reload` after editing
     // seamrule lines, radii, or plugin:seam:enabled in the config file) — without
     // this, a reload leaves every tracked window's corners stale until some
     // unrelated geometry/workspace/monitor event happens to fire.
-    static auto PRELOADED = Event::bus()->m_events.config.reloaded.listen([]() {
+    g_listeners.emplace_back(Event::bus()->m_events.config.reloaded.listen([]() {
         checkNativeRoundingIsZero();
         SeamState::recomputeAll();
-    });
+    }));
     // config.props_refreshed's exact trigger conditions aren't documented in the
     // installed EventBus.hpp beyond its name and `Event<const bool>` signature.
     // Wired as a defensive extra alongside the guaranteed `reloaded` path above,
@@ -136,7 +316,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // path still relies on an explicit window/workspace/monitor event or a full
     // `hyprctl reload` to pick up the new value; this listener is cheap and
     // harmless to keep regardless, in case other config-change paths do fire it.
-    static auto PPROPSREFRESHED = Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); });
+    g_listeners.emplace_back(Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); }));
 
     // Window tracking + adjacency recompute triggers (Task 5).
     //
@@ -153,35 +333,40 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // For the missing window-move/resize event, we follow the plan's documented
     // fallback: recompute from a general per-tick callback, gated by a cheap dirty
     // check (SeamState::onTick()) so idle ticks stay nearly free.
-    static auto PWINOPEN     = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); });
-    static auto PWINCLOSE    = Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); });
-    static auto PWINFLOAT    = Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); });
-    static auto PWINFULL     = Event::bus()->m_events.window.fullscreen.listen([](PHLWINDOW) { SeamState::recomputeAll(); });
-    static auto PWINMOVEWS   = Event::bus()->m_events.window.moveToWorkspace.listen([](PHLWINDOW, PHLWORKSPACE) { SeamState::recomputeAll(); });
-    static auto PWORKSPACE   = Event::bus()->m_events.workspace.active.listen([](PHLWORKSPACE) { SeamState::recomputeAll(); });
-    static auto PMONADDED    = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { SeamState::recomputeAll(); });
-    static auto PMONREMOVED  = Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR) { SeamState::recomputeAll(); });
-    static auto PMONLAYOUT   = Event::bus()->m_events.monitor.layoutChanged.listen([]() { SeamState::recomputeAll(); });
-    static auto PTICK        = Event::bus()->m_events.tick.listen([]() { SeamState::onTick(); });
+    g_listeners.emplace_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); }));
+    g_listeners.emplace_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); }));
+    g_listeners.emplace_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.window.fullscreen.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.window.moveToWorkspace.listen([](PHLWINDOW, PHLWORKSPACE) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.workspace.active.listen([](PHLWORKSPACE) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR) { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.monitor.layoutChanged.listen([]() { SeamState::recomputeAll(); }));
+    g_listeners.emplace_back(Event::bus()->m_events.tick.listen([]() { SeamState::onTick(); }));
 
     // Attach to every window already open at load time (the plugin can be
     // hot-loaded into a running session with windows already present).
+    // Includes windows hidden at load time (e.g. inactive members of a window group):
+    // they never fire window.open again when un-hidden, so skipping them here would leave
+    // them untracked (and square-cornered) until reopened.
     for (auto& w : Desktop::windowState()->windows()) {
-        if (!validMapped(w) || w->isHidden())
+        if (!validMapped(w))
             continue;
         SeamState::onWindowOpened(w);
     }
 
-    // Debug-only: lets us confirm the tracking/adjacency/animation state machine
-    // works before Task 7 adds the real render hook. Kept (rather than removed)
-    // per the task brief's option to leave it documented as debug-only; safe to
-    // delete once Task 7 lands and there's a visual way to check this instead.
+    // Diagnostic dispatcher (`hyprctl dispatch seam:debugstate`): shows a notification
+    // (and writes the same text to hyprland.log) listing every tracked window's live
+    // corner radii, '*' marking corners currently flagged as touching a neighbor. Not
+    // used by the render path; kept on purpose as a troubleshooting aid for bug reports.
     HyprlandAPI::addDispatcherV2(PHANDLE, "seam:debugstate", [](std::string) -> SDispatchResult {
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + SeamState::debugDump(), CHyprColor{0.4, 0.7, 1.0, 1.0}, 8000);
+        const auto dump = SeamState::debugDump();
+        Log::logger->log(Log::INFO, "[hypr-seam debugstate]\n{}", dump);
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + dump, CHyprColor{0.4, 0.7, 1.0, 1.0}, 8000);
         return {};
     });
 
-    // Task 6 spike: log-only hook on Render::IElementRenderer::drawSurface.
+    // Per-corner rendering hook on Render::IElementRenderer::drawSurface (SeamHook.cpp).
     // On failure install() has already shown a notification; the plugin stays
     // loaded but inert for rendering.
     SeamHook::install();
@@ -192,5 +377,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Order matters: stop rendering through our hook first, then drop every event
+    // listener (so nothing can call back into SeamState), then release the tracked
+    // window state and its animated variables, then the parsed rules. hl.plugin.seam.rule,
+    // the seamrule keyword, the dispatcher, and plugin:seam:* values are all
+    // unregistered by Hyprland itself on unload (PluginSystem / onPluginUnload).
     SeamHook::remove();
+    g_listeners.clear();
+    SeamState::clear();
+    SeamRuleStore::clear();
 }
