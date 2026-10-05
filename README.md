@@ -100,7 +100,8 @@ of what the seam flag would otherwise resolve to.
 
 Hyprland's plugin API has no hook into the native `windowrulev2` engine, so
 `hypr-seam` parses its own keyword, `seamrule`, using the same
-`class:`/`title:` match syntax as `windowrulev2`:
+`class:`/`title:` match syntax as `windowrulev2`. This works for a plain
+hyprlang `.conf`-syntax config:
 
 ```
 seamrule = rounding <tl> <tr> <bl> <br>, <match>
@@ -114,6 +115,21 @@ seamrule = rounding 4 4 22 22, class:^(kitty)$
 seamrule = seam 1, class:^(mpv)$
 seamrule = seam 0, class:^(foot)$   # opt out even if plugin:seam:enabled = true
 ```
+
+If your config is written in Hyprland's Lua config DSL instead (no plain
+`.conf` file for `seamrule` to live in), use `hl.plugin.seam.rule(...)`,
+which accepts either the exact same string a `seamrule` line would take, or
+a table:
+
+```lua
+hl.plugin.seam.rule("seam 0, class:^(foot)$")
+hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
+hl.plugin.seam.rule({ title = "^Picture-in-Picture$", seam = false })
+```
+
+A malformed rule (either form) shows up as a config error with a file/line
+reference, the same way Hyprland reports its own config mistakes, rather
+than silently doing nothing.
 
 ## Scope and limitations
 
@@ -129,3 +145,9 @@ seamrule = seam 0, class:^(foot)$   # opt out even if plugin:seam:enabled = true
   floating toggle, fullscreen, workspace switch, monitor changes), not
   every frame, so corners can be briefly stale mid-drag until the next
   event fires. This matches how Hyprland's own layout updates behave.
+- Windows in a Hyprland window group (a tabbed stack) currently flatten all
+  four corners against each other, since inactive group members occupy the
+  same box as the active one and the plugin doesn't yet know to exclude
+  them from adjacency. If you use groups, expect grouped windows to show
+  fully flattened corners rather than their normal rounding. A fix is
+  identified but not yet implemented.
