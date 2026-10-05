@@ -12,11 +12,17 @@
 //      corner's box) to just that corner, passing THAT corner's own live radius as `.round`.
 //      Hyprland's own rounded-rect shader does the rest — no custom GLSL needed.
 //
+//   3. The corner draws reuse the exact UV mapping the body paint used, recomputed through
+//      Hyprland's own (exported) IElementRenderer::calculateUVForSurface, so corners and body
+//      always sample the same texels — including during open/resize/reflow animations, when
+//      the client's buffer size lags the animated window box on nearly every frame.
+//
 // This relies on g_pHyprRenderer->m_renderData.damage being the thing that actually
 // restricts drawing (confirmed empirically + from source: the `damage` *parameter* to
 // drawSurface is never read). It does NOT work when m_renderData.clipBox is non-empty
 // (e.g. a floating window mid slide-animation) — in that rare case we fall back to the
 // native, square-cornered draw for that one frame rather than risk a corrupted clip.
+// Surfaces Hyprland itself marks dontRound (internal fullscreen) are also left native.
 #define WLR_USE_UNSTABLE
 
 #include "SeamHook.hpp"
@@ -42,6 +48,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <string>
 
 namespace {
     CFunctionHook* g_hook = nullptr;
@@ -58,9 +66,37 @@ namespace {
 
     constexpr const char* TARGET_DEMANGLED = "Render::IElementRenderer::drawSurface(Hyprutils::Memory::CWeakPointer<CSurfacePassElement>, Hyprutils::Math::CRegion const&)";
 
+    // Confirmed against /usr/include/hyprland/src/render/ElementRenderer.hpp (0.56.2) and the
+    // binary's dynamic symbol table (`nm -DC /usr/bin/Hyprland`): calculateUVForSurface is a
+    // private, non-virtual member of IElementRenderer, but its symbol IS exported, so it can be
+    // located via findFunctionsByName and called with the same leading-`this` convention as
+    // drawSurface above. SP<> arguments are non-trivially-copyable, so they're passed by
+    // invisible reference on both sides — declaring the same C++ parameter types gives a
+    // matching ABI.
+    using calculateUV_t = void (*)(void* thisptr, PHLWINDOW, SP<CWLSurfaceResource>, PHLMONITOR, bool main, const Vector2D& projSize, const Vector2D& projSizeUnscaled,
+                                   bool fixMisalignedFSV1);
+
+    constexpr const char* CALCUV_DEMANGLED =
+        "Render::IElementRenderer::calculateUVForSurface(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, "
+        "Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, bool, Hyprutils::Math::Vector2D const&, Hyprutils::Math::Vector2D const&, bool)";
+
+    calculateUV_t g_calculateUV = nullptr;
+
     // One corner's redraw box (in the same monitor-scaled, rounded pixel space as the
-    // windowBox drawSurface itself computes) plus the already-scaled-and-clamped integer
-    // radius to feed Hyprland's own rounded-rect shader for just that corner.
+    // windowBox drawSurface itself computes) plus the radius to feed Hyprland's own
+    // rounded-rect shader for just that corner.
+    //
+    // The box is always snapped OUTWARD to whole pixels (size = ceil(radius), anchored on the
+    // window's own integer edge). windowBox is already rounded to integers, so this makes the
+    // box exactly integral. That matters because CRegion(CBox) hands the double coordinates
+    // straight to pixman_region32_init_rect, which truncates x and width independently: with a
+    // fractional radius (fractional monitor scale, or mid-animation) a right/bottom patch at
+    // `edge - 16.5` became [edge-17, edge-1), leaving the outermost pixel column/row OUT of the
+    // pruned-away region, so the square body paint showed through as a 1px sliver beside the
+    // curve. The same integral box is used for both the damage subtraction and the corner-draw
+    // restriction, so the two can never disagree. `.round` stays the (rounded) real radius,
+    // since it controls the actual curve shape; the extra <1px of box beyond the curve is just
+    // painted as plain body by the corner draw.
     struct SCornerPatch {
         CBox box;
         int  round = 0; // scaled px; 0 means "no rounding needed here, leave it to the square body paint"
@@ -73,80 +109,34 @@ namespace {
         // can differ very slightly from the logical size SeamState clamped against (min-size
         // floor, rounding to whole scaled pixels).
         double       r    = std::max(0.0, liveRadiusLogicalPx) * monitorScale;
-        const double maxR = std::min(windowBox.width, windowBox.height) / 2.0;
+        const double maxR = std::floor(std::min(windowBox.width, windowBox.height) / 2.0);
         r                 = std::clamp(r, 0.0, maxR);
 
-        const double x = left ? windowBox.x : windowBox.x + windowBox.width - r;
-        const double y = top ? windowBox.y : windowBox.y + windowBox.height - r;
+        const int round = static_cast<int>(std::lround(r));
+        if (round <= 0)
+            return SCornerPatch{};
 
-        return SCornerPatch{CBox{x, y, r, r}, static_cast<int>(std::lround(r))};
+        const double size = std::ceil(r); // >= round, <= maxR (maxR is integral)
+        const double x    = left ? windowBox.x : windowBox.x + windowBox.width - size;
+        const double y    = top ? windowBox.y : windowBox.y + windowBox.height - size;
+
+        return SCornerPatch{CBox{x, y, size, size}, round};
     }
 
-    // Fix round 1: our own renderTexture() calls for the 4 corner patches never set
-    // allowCustomUV (nor a matching UV rect), so they always sample the plain default
-    // 0..1 UV quad. The main body's own paint (through callOriginal()) goes through
-    // IElementRenderer::calculateUVForSurface, which on some windows sets a REAL custom
-    // UV rect on the global g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft/
-    // BottomRight that CGLElementRenderer::draw(WP<CTexPassElement>) reads at the moment
-    // of that specific draw call. For those windows our corner patches would sample a
-    // different slice of the texture than the body immediately next to them — a visible
-    // seam exactly where we're trying to make a clean one.
-    //
-    // calculateUVForSurface itself is private and non-exported (not reachable from a
-    // plugin), and the "expected size" helper (getSurfaceExpectedSize) it depends on for
-    // one of its branches isn't in the installed headers at all (checked: it's not
-    // declared anywhere under /usr/include/hyprland), so that branch's exact trigger
-    // condition can't be safely re-derived here either — guessing at it would risk the
-    // same kind of silent mismatch this fix is trying to close. Instead, detect the
-    // cases we CAN cheaply and exactly replicate from public fields (both confirmed
-    // against the pinned 0.56.2 source, docs/hook-notes.md's own citation commit), plus
-    // one conservative heuristic backstop for the branch we can't replicate, and skip
-    // the entire per-corner mechanism for this window's frame when any of them trip —
-    // falling back to the plain, square-cornered callOriginal() draw, exactly like the
-    // existing clipBox fallback above. A window that skips this way keeps native (square)
-    // corners for that frame instead of risking a wrong-but-confident corner texture.
-    //
-    // 1. viewport.hasSource: the wp_viewporter protocol crops/scales the buffer via a
-    //    source rectangle — calculateUVForSurface maps UV to exactly that rectangle. Exact,
-    //    cheap, a public field.
-    // 2. MISALIGNEDFSV1: an exact replica of drawSurface's own boolean (ElementRenderer.cpp,
-    //    confirmed against the fetched 0.56.2 source) for the "fractional scale + legacy
-    //    wl_surface.set_buffer_scale(1) buffer is off by one-or-two physical pixels from the
-    //    window box" case, built from the same public fields drawSurface itself reads.
-    // 3. Backstop heuristic: if the surface's buffer size doesn't match our windowBox size
-    //    at all (beyond a few px of rounding slack) and neither of the above already caught
-    //    it, treat it as "possibly needs a custom UV we can't compute" and skip too. This
-    //    overapproximates the real "expected size ratio != 1" branch (errs toward skipping
-    //    more than strictly necessary), which is the safe direction to err in here.
-    bool surfaceNeedsCustomUV(const CSurfacePassElement::SRenderData& data, const CBox& windowBox) {
-        if (!data.surface)
-            return false;
-
+    // Replicates drawSurface's own MISALIGNEDFSV1 boolean exactly (ElementRenderer.cpp,
+    // confirmed against the pinned 0.56.2 source) from the same public fields drawSurface
+    // reads, so we can hand calculateUVForSurface the same `fixMisalignedFSV1` argument the
+    // real body draw used.
+    bool misalignedFSv1(const CSurfacePassElement::SRenderData& data, const CBox& windowBox) {
         const auto& surf = data.surface->m_current;
 
-        if (surf.viewport.hasSource)
-            return true;
-
-        const bool interactiveResizeInProgress =
+        const bool  interactiveResizeInProgress =
             data.pWindow && g_layoutManager->dragController()->target() && g_layoutManager->dragController()->mode() == MBIND_RESIZE;
 
-        const bool misalignedFSv1 = std::floor(data.pMonitor->m_scale) != data.pMonitor->m_scale && surf.scale == 1 && windowBox.size() != surf.bufferSize &&
+        return std::floor(data.pMonitor->m_scale) != data.pMonitor->m_scale && surf.scale == 1 && windowBox.size() != surf.bufferSize &&
             DELTALESSTHAN(windowBox.width, surf.bufferSize.x, 3) && DELTALESSTHAN(windowBox.height, surf.bufferSize.y, 3) &&
             (!data.pWindow || (!data.pWindow->sizeAnimation()->isBeingAnimated() && !interactiveResizeInProgress)) &&
             (!data.pLS || (!data.pLS->sizeAnimation()->isBeingAnimated()));
-
-        if (misalignedFSv1)
-            return true;
-
-        // Backstop: any other buffer-size/windowBox-size mismatch beyond a few px of
-        // rounding slack. Deliberately coarser than DELTALESSTHAN's "off by one-or-two" —
-        // this is the catch-all for the expected-size/ratio branch we can't exactly
-        // replicate, so it's fine (safe, even) if it also re-catches cases already caught
-        // above.
-        if (std::abs(windowBox.width - surf.bufferSize.x) > 3 || std::abs(windowBox.height - surf.bufferSize.y) > 3)
-            return true;
-
-        return false;
     }
 
     void hkDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
@@ -166,7 +156,16 @@ namespace {
         // Only act on the main window surface. Popups, subsurfaces, and layer-shell
         // surfaces (pWindow null, or mainSurface false, or popup true) pass straight
         // through to native handling untouched (docs/hook-notes.md).
-        if (!data.pWindow || !data.mainSurface || data.popup || !data.pMonitor || !data.texture) {
+        if (!data.pWindow || !data.mainSurface || data.popup || !data.pMonitor || !data.texture || !data.surface) {
+            callOriginal();
+            return;
+        }
+
+        // Hyprland already decided this surface must not be rounded at all this frame
+        // (Renderer.cpp sets dontRound for a window in internal FSMODE_FULLSCREEN; it's also
+        // the SRenderData default for anything renderWindow doesn't explicitly round). Respect
+        // that: draw exactly as native would, with no per-corner rounding of our own.
+        if (data.dontRound) {
             callOriginal();
             return;
         }
@@ -211,14 +210,6 @@ namespace {
             return;
         }
 
-        // Fix round 1: our corner patches can't safely reproduce a custom UV mapping —
-        // see surfaceNeedsCustomUV's own comment. Skip entirely for this window's frame
-        // rather than guess at one.
-        if (surfaceNeedsCustomUV(data, windowBox)) {
-            callOriginal();
-            return;
-        }
-
         static auto  PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float  roundingPower = *PPOWER;
         const double scale         = data.pMonitor->m_scale;
@@ -255,6 +246,24 @@ namespace {
         renderData.damage = savedDamage;
         data.dontRound    = savedDontRound;
 
+        // Reproduce the exact UV mapping the body paint just used. drawSurface computes it via
+        // calculateUVForSurface into m_renderData.primarySurfaceUV* and then resets those back
+        // to (-1,-1) in a scope guard on exit, so it's gone by now — recompute it with the very
+        // same arguments drawSurface passed (same windowBox, unscaled tex-box size, and our
+        // exact MISALIGNEDFSV1 replica), read it out, and put the globals back to the "no
+        // custom UV" state drawSurface left them in. This covers every case calculateUV
+        // handles (viewporter source crops, expand_undersized_textures, the resize/animation
+        // RATIO crop, fractional-scale misalignment) without guessing, so the corners always
+        // sample the same texels as the body right next to them — including during
+        // open/resize/reflow animations, where the buffer size lags the animated box on
+        // nearly every frame.
+        const Vector2D projSizeUnscaled = el->getTexBox().size();
+        (*g_calculateUV)(thisptr, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled, misalignedFSv1(data, windowBox));
+        const Vector2D uvTopLeft            = renderData.primarySurfaceUVTopLeft;
+        const Vector2D uvBottomRight        = renderData.primarySurfaceUVBottomRight;
+        renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+        renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+
         // Redraw each corner with its own live radius, restricted to just that corner's box
         // via a damage region containing only it (intersected with what was actually damaged
         // this frame). Hyprland's own rounded-rect shader (invoked once per corner with that
@@ -278,8 +287,11 @@ namespace {
                                                           .a             = ALPHA * OVERALLA,
                                                           .round         = patch.round,
                                                           .roundingPower = roundingPower,
+                                                          .allowCustomUV = true,
                                                           .wrapX         = data.wrapX,
                                                           .wrapY         = data.wrapY,
+                                                          .primarySurfaceUVTopLeft     = uvTopLeft,
+                                                          .primarySurfaceUVBottomRight = uvBottomRight,
                                                       });
         };
 
@@ -290,28 +302,55 @@ namespace {
     }
 } // namespace
 
-bool SeamHook::install() {
-    const auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "drawSurface");
+namespace {
+    enum class eLookup {
+        FOUND,
+        NOT_FOUND,
+        AMBIGUOUS,
+    };
 
-    void*      target = nullptr;
-    for (const auto& m : matches) {
-        Log::logger->log(Log::DEBUG, "[hypr-seam] drawSurface candidate: {} @ {}", m.demangled, m.address);
-        // On 0.56.2 only drawSurface itself was returned (not preDrawSurface), but
-        // match the exact demangled form anyway in case future versions differ.
-        if (m.demangled == TARGET_DEMANGLED) {
-            if (target) {
-                Log::logger->log(Log::ERR, "[hypr-seam] multiple exact drawSurface matches, refusing to hook");
-                target = nullptr;
-                break;
+    // Finds exactly one function whose demangled name equals `demangled`. Refuses (AMBIGUOUS)
+    // rather than guessing if more than one exact match exists.
+    eLookup findExact(const std::string& shortName, const char* demangled, void*& out) {
+        out = nullptr;
+        for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
+            Log::logger->log(Log::DEBUG, "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
+            if (m.demangled != demangled)
+                continue;
+            if (out) {
+                out = nullptr;
+                return eLookup::AMBIGUOUS;
             }
-            target = m.address;
+            out = m.address;
         }
+        return out ? eLookup::FOUND : eLookup::NOT_FOUND;
     }
 
-    if (!target) {
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Could not locate drawSurface to hook — rendering will not work.", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
-        return false;
+    bool reportLookupFailure(eLookup result, const std::string& what) {
+        if (result == eLookup::FOUND)
+            return false;
+
+        const std::string msg = result == eLookup::AMBIGUOUS ?
+            std::format("[hypr-seam] Found more than one exact match for {} — refusing to guess which to use. Rendering will not work.", what) :
+            std::format("[hypr-seam] Could not locate {} to hook — rendering will not work.", what);
+        Log::logger->log(Log::ERR, "{}", msg);
+        HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+        return true;
     }
+}
+
+bool SeamHook::install() {
+    void* target = nullptr;
+    if (reportLookupFailure(findExact("drawSurface", TARGET_DEMANGLED, target), "drawSurface"))
+        return false;
+
+    // Required too: without it the corner patches can't reproduce the body's UV mapping (see
+    // hkDrawSurface), so don't install the render hook at all rather than draw mismatched
+    // corners.
+    void* calcUV = nullptr;
+    if (reportLookupFailure(findExact("calculateUVForSurface", CALCUV_DEMANGLED, calcUV), "calculateUVForSurface"))
+        return false;
+    g_calculateUV = reinterpret_cast<calculateUV_t>(calcUV);
 
     g_hook = HyprlandAPI::createFunctionHook(PHANDLE, target, reinterpret_cast<void*>(&hkDrawSurface));
     if (!g_hook || !g_hook->hook()) {
@@ -319,7 +358,8 @@ bool SeamHook::install() {
         HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook drawSurface — rendering will not work.", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
         if (g_hook)
             HyprlandAPI::removeFunctionHook(PHANDLE, g_hook);
-        g_hook = nullptr;
+        g_hook        = nullptr;
+        g_calculateUV = nullptr;
         return false;
     }
 
@@ -330,5 +370,6 @@ bool SeamHook::install() {
 void SeamHook::remove() {
     if (g_hook)
         HyprlandAPI::removeFunctionHook(PHANDLE, g_hook);
-    g_hook = nullptr;
+    g_hook        = nullptr;
+    g_calculateUV = nullptr;
 }
