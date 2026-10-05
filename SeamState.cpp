@@ -9,6 +9,9 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/animation/AnimationManager.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 
 #include <unordered_map>
 #include <sstream>
@@ -37,6 +40,12 @@ std::unordered_map<PHLWINDOW, SWindowEntry> g_entries;
 // onTick() to skip recomputeAll() when nothing that could affect adjacency has
 // actually changed since the last tick.
 std::size_t g_lastFingerprint = 0;
+
+// Sequence id of a pending deferred (doLater) recompute scheduled by
+// onWindowClosed(), or 0 if none. Tracked so clear() (called on plugin unload)
+// can cancel it — an idle callback still queued after the .so is unmapped
+// would jump into freed code.
+uint64_t g_pendingCloseRecompute = 0;
 
 // Builds our own animation property config directly from plugin:seam:* values,
 // rather than looking one up by name in Hyprland's global animation tree
@@ -105,8 +114,9 @@ void retarget(PHLANIMVAR<float>& anim, double target) {
 
 // Collects every currently-visible mapped window (including ones on special
 // workspaces, as long as that special workspace is actually toggled open) as
-// adjacency boxes, in lockstep with a parallel list of the windows themselves
-// so `boxes[i]` and `windows[i]` always refer to the same window.
+// adjacency boxes, in lockstep with parallel lists of the windows themselves and
+// of each window's workspace, so `boxes[i]`, `windows[i]` and `workspaces[i]`
+// always refer to the same window.
 //
 // `w->isHidden()` (checked below) is a *group* visibility flag (m_hidden —
 // e.g. a window hidden inside a collapsed window group), not workspace
@@ -118,13 +128,21 @@ void retarget(PHLANIMVAR<float>& anim, double target) {
 // earlier version of this function, caught only because a single-workspace
 // manual test can't exercise it.
 //
+// Fullscreen/maximized: when a workspace has a covering fullscreen or maximized
+// window, the tiled windows it covers are still mapped and "visible" by every
+// flag above, but they're hidden behind it — and their edges sit exactly where the
+// covering window's screen-edge corners are, so they'd falsely flag those corners
+// as touching. So on such a workspace only the covering window itself (plus any
+// floating windows, which never act as neighbors and never flatten — kept only so
+// their base radii still get retargeted on config changes) participates. The
+// covered tiled windows are left out entirely: they aren't on screen, and the
+// window.fullscreen event re-runs recomputeAll() as soon as they're uncovered.
+//
 // `geomType` lets callers choose GEOMETRIC_CURRENT (the live, animated
-// position — what recomputeAll() needs to compute real on-screen adjacency)
-// or GEOMETRIC_GOAL (the animation target — what onTick()'s cheap dirty-check
-// fingerprints, so it doesn't fire on every intermediate frame of an
-// in-progress animation; see onTick()).
-void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>& windows,
-                            Desktop::View::IGeometric::eGeometricValueType geomType = Desktop::View::IGeometric::GEOMETRIC_CURRENT) {
+// position) or GEOMETRIC_GOAL (the animation target — what both recomputeAll()
+// and onTick()'s cheap dirty-check use; see recomputeAll()).
+void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>& windows, std::vector<const CWorkspace*>& workspaces,
+                           Desktop::View::IGeometric::eGeometricValueType geomType = Desktop::View::IGeometric::GEOMETRIC_CURRENT) {
     using Desktop::View::IGeometric;
 
     for (auto& w : Desktop::windowState()->windows()) {
@@ -134,26 +152,35 @@ void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>&
         if (!w->m_workspace || !w->m_workspace->isVisible())
             continue;
 
+        if (!w->m_isFloating) {
+            const auto FSWINDOW = Fullscreen::controller()->getFullscreenWindow(w->m_workspace);
+            if (FSWINDOW && FSWINDOW != w)
+                continue; // tiled window covered by this workspace's fullscreen/maximized window
+        }
+
         const auto pos  = w->position(geomType);
         const auto size = w->size(geomType);
         const int  id   = sc<int>(windows.size());
 
         windows.push_back(w);
+        workspaces.push_back(w->m_workspace.get());
         boxes.push_back(SSeamBox{pos.x, pos.y, size.x, size.y, w->m_isFloating, id});
     }
 }
 
 // Cheap fingerprint of everything that can affect adjacency output, so onTick()
 // can skip the full O(n^2) recompute on ticks where nothing moved.
-std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes) {
+std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const std::vector<const CWorkspace*>& workspaces) {
     std::size_t hash = boxes.size();
-    for (const auto& b : boxes) {
-        auto mix = [&hash](double v) { hash ^= std::hash<double>{}(v) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2); };
-        mix(b.x);
-        mix(b.y);
-        mix(b.w);
-        mix(b.h);
-        hash ^= std::hash<bool>{}(b.floating) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    auto        mix  = [&hash](std::size_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2); };
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        const auto& b = boxes[i];
+        mix(std::hash<double>{}(b.x));
+        mix(std::hash<double>{}(b.y));
+        mix(std::hash<double>{}(b.w));
+        mix(std::hash<double>{}(b.h));
+        mix(std::hash<bool>{}(b.floating));
+        mix(std::hash<const void*>{}(workspaces[i]));
     }
     return hash;
 }
@@ -180,6 +207,28 @@ void SeamState::onWindowOpened(PHLWINDOW window) {
 
 void SeamState::onWindowClosed(PHLWINDOW window) {
     g_entries.erase(window);
+
+    // The closed window's former neighbors may have just lost a touching corner
+    // (or will be reflowed into its space); update them promptly instead of
+    // waiting for the tick fallback. Deferred to the next event-loop idle rather
+    // than run inline: window.close is emitted at the very start of
+    // CWindow::unmapWindow(), while the closing window is still m_isMapped and
+    // before the layout has removed it / retargeted its neighbors' goal
+    // geometry, so an inline recompute would still see the old layout.
+    if (g_pendingCloseRecompute == 0 && g_pEventLoopManager) {
+        g_pendingCloseRecompute = g_pEventLoopManager->doLater([] {
+            g_pendingCloseRecompute = 0;
+            recomputeAll();
+        });
+    }
+}
+
+void SeamState::clear() {
+    if (g_pendingCloseRecompute != 0 && g_pEventLoopManager)
+        g_pEventLoopManager->removeDoLater(g_pendingCloseRecompute);
+    g_pendingCloseRecompute = 0;
+    g_entries.clear();
+    g_lastFingerprint = 0;
 }
 
 SeamState::SLiveCorners* SeamState::liveCornersFor(PHLWINDOW window) {
@@ -210,9 +259,19 @@ void SeamState::recomputeAll() {
     // recompute — whenever it happens to fire — always judges adjacency
     // against the final, authoritative layout, never an in-between frame, so
     // there's nothing for a later recompute to need to "correct".
-    std::vector<SSeamBox>  boxes;
-    std::vector<PHLWINDOW> windows;
-    collectVisibleWindows(boxes, windows, Desktop::View::IGeometric::GEOMETRIC_GOAL);
+    std::vector<SSeamBox>           boxes;
+    std::vector<PHLWINDOW>          windows;
+    std::vector<const CWorkspace*> workspaces;
+    collectVisibleWindows(boxes, windows, workspaces, Desktop::View::IGeometric::GEOMETRIC_GOAL);
+
+    // Adjacency is only ever judged between windows on the SAME workspace (and so,
+    // implicitly, the same monitor). Pooling everything together let a window's
+    // screen-edge corner land within tolerance of a window on the neighboring
+    // monitor (only gaps_out apart, or less with a raised tolerance), or of a window
+    // on a special workspace overlaid on top, and get falsely flattened.
+    std::unordered_map<const CWorkspace*, std::vector<SSeamBox>> pools;
+    for (size_t i = 0; i < boxes.size(); ++i)
+        pools[workspaces[i]].push_back(boxes[i]);
 
     for (size_t i = 0; i < windows.size(); ++i) {
         auto& w = windows[i];
@@ -239,7 +298,8 @@ void SeamState::recomputeAll() {
             continue;
         }
 
-        const SCornerFlags touching = computeTouchingCorners(subjectBox, boxes, defaults.tolerance);
+        const auto&        pool     = pools[workspaces[i]];
+        const SCornerFlags touching = computeTouchingCorners(subjectBox, pool, defaults.tolerance);
 
         // Hysteresis: once a corner is flagged as touching, don't drop the flag the
         // instant the normal-tolerance check fails — only drop it once a *widened*
@@ -247,7 +307,7 @@ void SeamState::recomputeAll() {
         // boundary rather than merely crossed it. (The reverse direction — going
         // from unflagged to flagged — always uses the normal tolerance immediately;
         // hysteresis only guards against flicker on the way out.)
-        const SCornerFlags widened = computeTouchingCorners(subjectBox, boxes, defaults.tolerance * 1.5);
+        const SCornerFlags widened = computeTouchingCorners(subjectBox, pool, defaults.tolerance * 1.5);
 
         auto resolveCorner = [&](bool rawTouching, bool widenedTouching, bool& wasTouching, double baseRadius) {
             bool effectiveTouching;
@@ -287,10 +347,12 @@ void SeamState::onTick() {
     // in bursts while the compositor is actively rendering/animating and goes
     // fully silent once idle. recomputeAll() no longer depends on a trailing
     // tick to "catch" a settled layout — see the GOAL-geometry comment there.)
-    static std::vector<SSeamBox>  boxes;
-    static std::vector<PHLWINDOW> windows;
+    static std::vector<SSeamBox>           boxes;
+    static std::vector<PHLWINDOW>          windows;
+    static std::vector<const CWorkspace*> workspaces;
     boxes.clear();
     windows.clear();
+    workspaces.clear();
 
     // Fingerprint the *goal* geometry, not the live/animated current geometry.
     // Using GEOMETRIC_CURRENT here would make the fingerprint change on every
@@ -301,9 +363,13 @@ void SeamState::onTick() {
     // settled positions — every frame for as long as anything is animating.
     // The goal/target geometry only changes once per actual layout change, so
     // fingerprinting that instead keeps this gate cheap and correct.
-    collectVisibleWindows(boxes, windows, Desktop::View::IGeometric::GEOMETRIC_GOAL);
+    collectVisibleWindows(boxes, windows, workspaces, Desktop::View::IGeometric::GEOMETRIC_GOAL);
 
-    const std::size_t fingerprint = fingerprintVisibleWindows(boxes);
+    // Don't keep strong window refs alive in these reused statics between ticks
+    // (they'd pin closed windows, and would outlive a plugin unload).
+    windows.clear();
+
+    const std::size_t fingerprint = fingerprintVisibleWindows(boxes, workspaces);
     if (fingerprint == g_lastFingerprint)
         return;
 
@@ -315,7 +381,13 @@ std::string SeamState::debugDump() {
     std::ostringstream out;
     out << g_entries.size() << " tracked window(s)\n";
     for (auto& [w, entry] : g_entries) {
-        out << "- " << (w ? w->m_class : std::string{"<null>"}) << ": "
+        out << "- " << (w ? w->m_class : std::string{"<null>"}) << " [" << (w ? w->m_title.substr(0, 32) : std::string{}) << "]";
+        if (w) {
+            const auto pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL);
+            const auto size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL);
+            out << " @" << pos.x << "," << pos.y << " " << size.x << "x" << size.y;
+        }
+        out << ": "
             << "TL=" << entry.topLeft->value() << (entry.wasTouching[0] ? "*" : "") << " "
             << "TR=" << entry.topRight->value() << (entry.wasTouching[1] ? "*" : "") << " "
             << "BL=" << entry.bottomLeft->value() << (entry.wasTouching[2] ? "*" : "") << " "

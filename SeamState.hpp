@@ -33,6 +33,11 @@ namespace SeamState {
     void onWindowOpened(PHLWINDOW window);
     void onWindowClosed(PHLWINDOW window);
 
+    // Drops every tracked window entry (and its animated variables) and cancels
+    // any pending deferred recompute. Called from PLUGIN_EXIT so no window refs,
+    // animated vars, or queued callbacks outlive the plugin.
+    void clear();
+
     // Hyprland's event bus has no standalone "window moved/resized" event (confirmed
     // against the installed EventBus.hpp — only open/close/floating/fullscreen/
     // moveToWorkspace exist for windows). Call this from a `tick` listener in
@@ -46,9 +51,9 @@ namespace SeamState {
     // actually keeps the result correct regardless of when this fires.
     void onTick();
 
-    // Debug-only: dumps every tracked window's live corner radii and touching state
-    // as a human-readable string, for manual verification via a temporary dispatcher
-    // (see main.cpp) before Task 7 adds real rendering. Not part of the steady-state
-    // plugin interface; safe to remove once rendering lands if it's no longer useful.
+    // Diagnostic only (backs the `seam:debugstate` dispatcher in main.cpp): dumps
+    // every tracked window's live corner radii and touching state ('*' = corner
+    // currently flagged as touching) as a human-readable string. Not used by the
+    // render path; kept as a troubleshooting aid for bug reports.
     std::string debugDump();
 }

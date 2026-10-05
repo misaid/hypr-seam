@@ -1,5 +1,6 @@
 #include "Adjacency.hpp"
 #include <algorithm>
+#include <cmath>
 
 static bool pointOnEdge(double px, double py, const SSeamBox& n, double tolerance) {
     const bool onVerticalEdge   = (std::abs(n.x - px) <= tolerance || std::abs(n.x + n.w - px) <= tolerance) &&
