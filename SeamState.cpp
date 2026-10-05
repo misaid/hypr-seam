@@ -224,7 +224,7 @@ void SeamState::recomputeAll() {
         auto&       entry      = it->second;
         const auto& subjectBox = boxes[i];
 
-        auto resolved = resolveWindowConfig(w->m_class, w->m_isFloating, defaults, SeamRuleStore::rules());
+        auto resolved = resolveWindowConfig(w->m_class, w->m_title, w->m_isFloating, defaults, SeamRuleStore::rules());
 
         if (!resolved.seamEnabled) {
             // Seam is off for this window (globally, by rule, or because it's floating):

@@ -2,20 +2,31 @@
 #include <regex>
 #include <sstream>
 
-SResolvedWindowConfig resolveWindowConfig(const std::string& windowClass, bool isFloating,
+static bool patternMatches(const std::string& pattern, const std::string& subject, bool& matched) {
+    if (pattern.empty())
+        return true; // this field is unconstrained by the rule
+    std::regex re;
+    try {
+        re = std::regex(pattern);
+    } catch (const std::regex_error&) {
+        return false; // malformed pattern: treat the whole rule as invalid, skip rather than crash
+    }
+    matched = true;
+    return std::regex_search(subject, re);
+}
+
+SResolvedWindowConfig resolveWindowConfig(const std::string& windowClass, const std::string& windowTitle, bool isFloating,
                                           const SGlobalSeamDefaults& defaults, const std::vector<SSeamRule>& rules) {
     SResolvedWindowConfig result{.radii = defaults.baseRadii, .seamEnabled = defaults.seamEnabled};
 
     for (const auto& rule : rules) {
-        std::regex re;
-        try {
-            re = std::regex(rule.classPattern);
-        } catch (const std::regex_error&) {
-            continue; // malformed pattern, skip rather than crash
-        }
-
-        if (!std::regex_search(windowClass, re))
+        bool anyPattern = false;
+        if (!patternMatches(rule.classPattern, windowClass, anyPattern))
             continue;
+        if (!patternMatches(rule.titlePattern, windowTitle, anyPattern))
+            continue;
+        if (!anyPattern)
+            continue; // a rule with no matcher at all never matches
 
         if (rule.isSeamDirective)
             result.seamEnabled = rule.seamOn;
@@ -42,10 +53,24 @@ bool parseSeamRuleLine(const std::string& value, SSeamRule& outRule) {
     if (firstNonSpace != std::string::npos)
         match = match.substr(firstNonSpace);
 
+    // trim trailing whitespace on the match part (a regex can't meaningfully end in
+    // unescaped whitespace from a config line, and hyprlang may leave some)
+    const auto lastNonSpace = match.find_last_not_of(" \t");
+    match                   = lastNonSpace == std::string::npos ? std::string{} : match.substr(0, lastNonSpace + 1);
+
     const std::string classPrefix = "class:";
-    if (match.rfind(classPrefix, 0) != 0)
+    const std::string titlePrefix = "title:";
+    outRule.classPattern.clear();
+    outRule.titlePattern.clear();
+    if (match.rfind(classPrefix, 0) == 0)
+        outRule.classPattern = match.substr(classPrefix.size());
+    else if (match.rfind(titlePrefix, 0) == 0)
+        outRule.titlePattern = match.substr(titlePrefix.size());
+    else
         return false;
-    outRule.classPattern = match.substr(classPrefix.size());
+
+    if (outRule.classPattern.empty() && outRule.titlePattern.empty())
+        return false;
 
     std::istringstream iss(directive);
     std::string        keyword;
@@ -53,7 +78,7 @@ bool parseSeamRuleLine(const std::string& value, SSeamRule& outRule) {
 
     if (keyword == "seam") {
         int val;
-        if (!(iss >> val))
+        if (!(iss >> val) || !(iss >> std::ws).eof())
             return false;
         outRule.isSeamDirective = true;
         outRule.seamOn          = val != 0;
@@ -62,7 +87,7 @@ bool parseSeamRuleLine(const std::string& value, SSeamRule& outRule) {
 
     if (keyword == "rounding") {
         double tl, tr, bl, br;
-        if (!(iss >> tl >> tr >> bl >> br))
+        if (!(iss >> tl >> tr >> bl >> br) || !(iss >> std::ws).eof())
             return false;
         outRule.isSeamDirective = false;
         outRule.radii           = {tl, tr, bl, br};
