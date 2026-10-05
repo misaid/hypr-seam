@@ -88,6 +88,7 @@ All values live under the `plugin:seam:` prefix.
 | `plugin:seam:animate` | bool | `true` | Eases a corner's radius between its base and seam values instead of snapping. |
 | `plugin:seam:animation_speed` | float (ms) | `300` | Duration of that easing transition. |
 | `plugin:seam:animation_curve` | string | `"default"` | Name of a bezier curve already registered via Hyprland's `bezier =` (or `hl.curve(...)`). |
+| `plugin:seam:force_round_risky_surfaces` | bool | `false` | Also round a window's subsurfaces where they reach the window's own corners. Turn this on if Firefox-based browsers (Firefox, Zen, ...) keep square corners. See below. |
 
 Base corner radii are resolved per window as: a matching `seamrule rounding`
 override if one exists, otherwise the four global `rounding_*` values. The
@@ -145,6 +146,17 @@ than silently doing nothing.
   floating toggle, fullscreen, workspace switch, monitor changes), not
   every frame, so corners can be briefly stale mid-drag until the next
   event fires. This matches how Hyprland's own layout updates behave.
+- By default only a window's main surface is rounded, not its subsurfaces.
+  Firefox-based browsers (Firefox, Zen, and others) draw the whole window
+  into a subsurface that covers the main surface exactly, so the rounded
+  main surface is hidden and the window looks square. Set
+  `plugin:seam:force_round_risky_surfaces = true` to also round any
+  subsurface at the window corners it shares with the window. A subsurface
+  that doesn't reach a window corner (an embedded video, for example) is
+  never rounded. This is off by default because it changes how other
+  apps' subsurfaces are drawn, and it has only been tested with Firefox.
+  During a resize animation the subsurface can briefly lag the window box,
+  so its corners can show square for a few frames.
 - Windows in a Hyprland window group (a tabbed stack) currently flatten all
   four corners against each other, since inactive group members occupy the
   same box as the active one and the plugin doesn't yet know to exclude

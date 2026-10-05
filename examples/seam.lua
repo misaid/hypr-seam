@@ -60,6 +60,14 @@ hl.config({
             -- (or a `bezier =` line in a plain .conf config) to drive the
             -- easing above. "default" is Hyprland's built-in curve.
             animation_curve = "default",
+
+            -- Also round a window's subsurfaces where they reach the
+            -- window's own corners. Turn this on if Firefox-based browsers
+            -- (Firefox, Zen, ...) keep square corners: they draw the whole
+            -- window into a subsurface that hides the rounded main surface.
+            -- Off by default because it affects how every app's
+            -- subsurfaces are drawn.
+            force_round_risky_surfaces = false,
         },
     },
 })

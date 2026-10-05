@@ -96,6 +96,8 @@ Task 7 must filter on `pWindow && mainSurface && !popup`, or whatever policy it 
 (Only main window surfaces were observed in testing. Popup, subsurface and layer firing is inferred
 from the source: `drawElement` routes every `EK_SURFACE` here. Filtering out subsurfaces means
 subsurfaces such as video or GL child surfaces that reach the window corners keep square corners.)
+Later, confirmed in practice: Firefox-based browsers (Firefox 156, and the same engine in Zen) draw the
+whole window into a subsurface. See "Subsurfaces and `force_round_risky_surfaces`" below.
 `element.get()` is valid only for the duration of that one hook call; never store it.
 
 ## GL scissor / clip primitive, and how to actually clip the window draw
@@ -276,3 +278,46 @@ Background colour `rgb(ff8800)`, `gaps_out = 40`, no borders, shadows, blur or a
   background. A floating window over a tiled one shows the tiled window's content in its corners.
   A fullscreen window is fully square with no cut-outs. At scale 1.25 with two tiled windows, there
   are no black pixels anywhere on the frame.
+
+## Subsurfaces and `force_round_risky_surfaces`
+
+### Why Firefox and Zen stayed square
+
+Temporary per-surface logging in `hkDrawSurface` (nested instance, Firefox 156 under Wayland,
+`plugin:seam:enabled = true`) showed two `drawSurface` calls for the Firefox window every frame:
+
+```
+class=firefox main=true  counter=0 localPos=(0,0) surfSize=758x820 w=758 h=820 dontRound=false tracked=true -> ROUNDED
+class=firefox main=false counter=1 localPos=(0,0) surfSize=758x820 w=758 h=820 dontRound=false tracked=true -> bail: not main surface
+```
+
+The main surface was rounded correctly. Firefox then draws its whole window (toolbar and page) into a
+`wl_subsurface` at offset (0,0) with exactly the window's size. The hook skipped that subsurface,
+because of the `!data.mainSurface` part of its first check, so the subsurface was drawn natively and
+square on top of the rounded corners. `dontRound` was false and the window was tracked, so those
+checks were not the cause.
+
+### The flag
+
+With `plugin:seam:force_round_risky_surfaces = true`, `hkDrawSurface` no longer skips subsurfaces
+that have `pWindow` set and are not popups. Every other bail-out still applies: `dontRound`, texture
+not ok, window not tracked, a non-empty `clipBox`, and a degenerate box. For a subsurface, the hook
+compares its scaled, rounded tex box with the window's frame box (`pos` plus `w`/`h`, built the same
+way `getTexBox()` builds the main surface box) and keeps a corner's live radius only when the
+subsurface's corner is within 1 px of the window's corner. A subsurface that reaches no window corner
+is passed to the original unchanged. The body and corner drawing is then the same as for the main
+surface. `calculateUVForSurface` gets `main = false`, as the original drawSurface would pass for this
+surface.
+
+`hkOpaqueRegion` also handles these subsurfaces when the flag is on. It removes the window's corner
+boxes (from the frame box, not the subsurface's own box) from the subsurface's opaque region. Without
+this, the full-window subsurface would report the corners as opaque, and the backdrop under them
+would not be repainted (the black-corner bug above, but for the subsurface). Removing boxes from a
+subsurface that does not reach a corner only costs some extra backdrop drawing.
+
+Verified in a nested instance with Firefox 156 tiled next to Ghostty, seam on. With the flag off,
+Firefox is square and Ghostty is rounded with the seam corners flattened, the same as before. With
+the flag on, Firefox's outer corners show the background `(255,136,0)` at the corner pixels and its
+seam corners are flattened. This was also checked at scale 1.25, with Firefox floating over Ghostty
+(Ghostty content shows in Firefox's corners, no black), after resize animations, and after toggling
+the flag at runtime with `hyprctl keyword`.

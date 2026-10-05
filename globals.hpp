@@ -23,6 +23,7 @@ struct SVars {
     SP<Config::Values::CBoolValue>   animate;
     SP<Config::Values::CFloatValue>  animationSpeed;
     SP<Config::Values::CStringValue> animationCurve;
+    SP<Config::Values::CBoolValue>   forceRoundRiskySurfaces;
 };
 
 inline SVars vars = {};

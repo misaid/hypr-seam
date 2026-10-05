@@ -23,6 +23,12 @@
 // (e.g. a floating window mid slide-animation) — in that rare case we fall back to the
 // native, square-cornered draw for that one frame rather than risk a corrupted clip.
 // Surfaces Hyprland itself marks dontRound (internal fullscreen) are also left native.
+//
+// Subsurfaces are left native by default too. That is why Firefox-based browsers (Firefox,
+// Zen, ...) stay square: they draw their whole page into a wl_subsurface that exactly covers
+// the main surface, so the main surface's rounded corners are hidden underneath it. With
+// plugin:seam:force_round_risky_surfaces = true, a subsurface that reaches one or more of the
+// window's own corners gets those corners rounded too (see subsurfaceCorners()).
 #define WLR_USE_UNSTABLE
 
 #include "SeamHook.hpp"
@@ -123,6 +129,43 @@ namespace {
         return SCornerPatch{CBox{x, y, size, size}, round};
     }
 
+    bool forceRoundRiskySurfaces() {
+        return vars.forceRoundRiskySurfaces && vars.forceRoundRiskySurfaces->value();
+    }
+
+    // The window's own frame box (data.pos + data.w/h, i.e. the main surface's box without
+    // the small-surface centering), in the same monitor-scaled, rounded pixel space as
+    // hkDrawSurface's windowBox. Built the same way getTexBox() builds a box.
+    CBox windowFrameBox(const CSurfacePassElement::SRenderData& data) {
+        const auto& mon = data.pMonitor;
+        CBox        box{sc<int>(-mon->m_position.x) + data.pos.x, sc<int>(-mon->m_position.y) + data.pos.y, data.w, data.h};
+        box.scale(mon->m_scale);
+        box.round();
+        return box;
+    }
+
+    // For a subsurface (only reached with force_round_risky_surfaces on): keep a corner's live
+    // radius only where the subsurface's own corner sits on the window's corner, zero the rest.
+    // A subsurface that reaches a window corner covers the main surface's rounded corner there,
+    // so it has to be cut the same way or the window looks square. A subsurface that doesn't
+    // reach a corner (a video, a toolbar strip in the middle) must NOT be rounded at all. The
+    // 1px slack absorbs rounding differences between the two boxes.
+    SeamState::SLiveCorners subsurfaceCorners(const SeamState::SLiveCorners& live, const CBox& surfBox, const CBox& frame) {
+        auto near = [](double a, double b) { return std::abs(a - b) <= 1.0; };
+
+        const bool L = near(surfBox.x, frame.x);
+        const bool R = near(surfBox.x + surfBox.width, frame.x + frame.width);
+        const bool T = near(surfBox.y, frame.y);
+        const bool B = near(surfBox.y + surfBox.height, frame.y + frame.height);
+
+        return SeamState::SLiveCorners{
+            .topLeft     = L && T ? live.topLeft : 0.0,
+            .topRight    = R && T ? live.topRight : 0.0,
+            .bottomLeft  = L && B ? live.bottomLeft : 0.0,
+            .bottomRight = R && B ? live.bottomRight : 0.0,
+        };
+    }
+
     // Replicates drawSurface's own MISALIGNEDFSV1 boolean exactly (ElementRenderer.cpp,
     // confirmed against the pinned 0.56.2 source) from the same public fields drawSurface
     // reads, so we can hand calculateUVForSurface the same `fixMisalignedFSV1` argument the
@@ -153,10 +196,18 @@ namespace {
         auto* el   = element.get();
         auto& data = el->m_data;
 
-        // Only act on the main window surface. Popups, subsurfaces, and layer-shell
-        // surfaces (pWindow null, or mainSurface false, or popup true) pass straight
-        // through to native handling untouched (docs/hook-notes.md).
-        if (!data.pWindow || !data.mainSurface || data.popup || !data.pMonitor || !data.texture || !data.surface) {
+        // Only act on window surfaces. Popups and layer-shell surfaces (pWindow null, or popup
+        // true) always pass straight through to native handling untouched
+        // (docs/hook-notes.md).
+        if (!data.pWindow || data.popup || !data.pMonitor || !data.texture || !data.surface) {
+            callOriginal();
+            return;
+        }
+
+        // Subsurfaces are native (square) unless force_round_risky_surfaces is on. This is the
+        // check that leaves Firefox/Zen square: their page content is a full-window subsurface.
+        const bool isSubsurface = !data.mainSurface;
+        if (isSubsurface && !forceRoundRiskySurfaces()) {
             callOriginal();
             return;
         }
@@ -178,7 +229,7 @@ namespace {
             return;
         }
 
-        auto* corners = SeamState::liveCornersFor(data.pWindow);
+        const auto* corners = SeamState::liveCornersFor(data.pWindow);
         if (!corners) {
             callOriginal();
             return;
@@ -210,14 +261,22 @@ namespace {
             return;
         }
 
+        // Main surface: all four live corners. Subsurface: only the corners it shares with the
+        // window; one that reaches none of them is drawn natively.
+        const SeamState::SLiveCorners radii = isSubsurface ? subsurfaceCorners(*corners, windowBox, windowFrameBox(data)) : *corners;
+        if (isSubsurface && radii.topLeft <= 0 && radii.topRight <= 0 && radii.bottomLeft <= 0 && radii.bottomRight <= 0) {
+            callOriginal();
+            return;
+        }
+
         static auto  PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float  roundingPower = *PPOWER;
         const double scale         = data.pMonitor->m_scale;
 
-        const SCornerPatch patchTL = makeCornerPatch(windowBox, true, true, corners->topLeft, scale);
-        const SCornerPatch patchTR = makeCornerPatch(windowBox, false, true, corners->topRight, scale);
-        const SCornerPatch patchBL = makeCornerPatch(windowBox, true, false, corners->bottomLeft, scale);
-        const SCornerPatch patchBR = makeCornerPatch(windowBox, false, false, corners->bottomRight, scale);
+        const SCornerPatch patchTL = makeCornerPatch(windowBox, true, true, radii.topLeft, scale);
+        const SCornerPatch patchTR = makeCornerPatch(windowBox, false, true, radii.topRight, scale);
+        const SCornerPatch patchBL = makeCornerPatch(windowBox, true, false, radii.bottomLeft, scale);
+        const SCornerPatch patchBR = makeCornerPatch(windowBox, false, false, radii.bottomRight, scale);
 
         // Save the actual region the original draws into (the `damage` parameter is never
         // read by drawSurface — confirmed in docs/hook-notes.md), subtract the 4 corner
@@ -342,7 +401,9 @@ namespace {
         // dontRound surfaces (internal fullscreen) are drawn square by hkDrawSurface, so their
         // native opaque region is already correct; leave them alone so a fullscreen window
         // keeps occluding everything beneath it at full efficiency.
-        if (!data.pWindow || !data.mainSurface || data.popup || data.dontRound || !data.pMonitor)
+        if (!data.pWindow || data.popup || data.dontRound || !data.pMonitor)
+            return region;
+        if (!data.mainSurface && !forceRoundRiskySurfaces())
             return region;
 
         const auto* corners = SeamState::liveCornersFor(data.pWindow);
@@ -356,7 +417,11 @@ namespace {
         // cut-out by 2 logical px and snap it outward to whole logical px. Over-cutting a sliver
         // only means a few extra backdrop pixels get painted (then covered by our corner draw);
         // under-cutting would leave a black/stale fringe.
-        const CBox texBox = el->getTexBox();
+        // A subsurface (force_round_risky_surfaces only) gets the WINDOW's corner boxes cut out,
+        // not its own: those are where hkDrawSurface may round it. Cutting them from a
+        // subsurface that doesn't actually reach a corner just costs a little extra backdrop
+        // drawing, which is always safe.
+        const CBox texBox = data.mainSurface ? el->getTexBox() : CBox{data.pos - data.pMonitor->m_position, Vector2D{data.w, data.h}};
         if (texBox.width <= 0 || texBox.height <= 0)
             return region;
 
