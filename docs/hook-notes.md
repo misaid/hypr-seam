@@ -210,3 +210,69 @@ socket `wayland-2`), always targeted with `hyprctl -i <signature>`. The live ses
    - Reloaded the plugin as a fresh `.so` copy: hook re-installed at the same address and fired
      again on the next window.
    - Unloaded, killed the nested instance, and confirmed `hyprctl instances` showed only the live one.
+
+## Second hook: `CSurfacePassElement::opaqueRegion()` (black/stale corner fix)
+
+### Why it is needed
+
+The plugin requires `decoration:rounding = 0`. With that setting, `m_data.rounding` is 0 for every
+window, so the native `CSurfacePassElement::opaqueRegion()` reports the whole window box as opaque
+for any opaque surface (most terminals and GTK apps). `CRenderPass::simplify()` subtracts that
+region from the damage of everything drawn underneath: the wallpaper or clear colour, other
+windows, layer surfaces. The corner cut-outs that the `drawSurface` hook leaves are therefore never
+repainted. On screen they show black (a fresh buffer) or stale content from an earlier frame instead
+of the real backdrop.
+
+### Target and ABI (0.56.2)
+
+- Declaration: `virtual CRegion CSurfacePassElement::opaqueRegion();` in
+  `src/render/pass/SurfacePassElement.hpp`. It overrides `IPassElement::opaqueRegion()`, which is
+  documented as returning monitor-local logical coordinates.
+- Exported symbol: `CSurfacePassElement::opaqueRegion()` (`nm -DC /usr/bin/Hyprland`). It is found
+  with the same exact-demangled-name lookup as `drawSurface` and is the only match.
+- The calling convention differs from `drawSurface`'s. `CRegion` is not trivially copyable, so the
+  Itanium ABI returns it through a hidden caller-allocated slot passed in `rdi`, and `this` moves to
+  `rsi`. Disassembly of the installed body confirms this: `rdi` is kept as the result slot, and
+  `[rsi+0x50]` is read as `m_data.surface`. A free function `CRegion hk(void* thisptr)` lowers the
+  same way (sret in `rdi`, `thisptr` in `rsi`). Declaring `CRegion` as the return type on both the
+  hook and the `m_original` cast therefore matches the ABI. Do not declare it as returning `void`,
+  a pointer, or a trivially copyable struct. That would shift `this` into the wrong register.
+- Hooking the function body covers every virtual dispatch, because the vtable points at this body.
+  `CSurfacePassElement` has single, non-virtual inheritance from `IPassElement`, so `this` needs no
+  adjustment.
+
+### What the hook does
+
+1. Calls the original to get the native region. If it is empty, it is returned unchanged.
+2. Applies the same filter as `hkDrawSurface`: main window surface only, no popups, a monitor
+   present, and not `dontRound`. Internal-fullscreen (`dontRound`) windows are drawn square, so
+   their native region is already correct and they keep occluding everything at full efficiency.
+3. For each corner with a live radius above 0, it subtracts a box of `ceil(radius) + 2` logical px
+   from the region. The box is anchored on that corner of `getTexBox()` and snapped outward to whole
+   logical px. The 2 px of padding and the outward snap cover `simplify()` scaling and rounding
+   every rect by the monitor scale, and the corner patches using `ceil(radius * scale)` physical
+   px. If the cut is slightly too large, a few extra backdrop pixels are painted and then covered by
+   the corner draw. If it were too small, a black or stale fringe would remain.
+
+Making the opaque region smaller is always safe for correctness. It can only cause extra, correct
+drawing underneath, never missing drawing. The cost is a small amount of extra overdraw per rounded
+window.
+
+Install failure is not fatal. If the symbol is missing or ambiguous, or the hook fails to install,
+the plugin logs an error and shows an orange notification, and the `drawSurface` hook keeps
+working. Corners may then show black or stale content. `SeamHook::remove()` removes this hook
+before the `drawSurface` hook.
+
+### Verification (nested instance, scale 1 and 1.25)
+
+Background colour `rgb(ff8800)`, `gaps_out = 40`, no borders, shadows, blur or animations.
+- Old build (HEAD before the fix), two tiled opaque `foot` windows with the seam on: all 4 outer
+  corner cut-outs were pure `(0,0,0)`. That was 410 black pixels in total, all at the window
+  corners.
+- New build, same scene after a hot-swap: the same pixels are `(255,136,0)`, the background. The
+  only black pixels left belong to the mouse cursor. The flattened seam corners still render
+  correctly.
+- Regression checks with the new build: a single window has all 4 corners rounded over the
+  background. A floating window over a tiled one shows the tiled window's content in its corners.
+  A fullscreen window is fully square with no cut-outs. At scale 1.25 with two tiled windows, there
+  are no black pixels anywhere on the frame.

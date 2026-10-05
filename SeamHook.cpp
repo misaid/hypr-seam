@@ -300,6 +300,84 @@ namespace {
         drawCorner(patchBL);
         drawCorner(patchBR);
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Second hook: CSurfacePassElement::opaqueRegion() (black/stale-corner fix).
+    //
+    // Confirmed against /usr/include/hyprland/src/render/pass/SurfacePassElement.hpp (0.56.2):
+    //   virtual CRegion CSurfacePassElement::opaqueRegion();   // public, VIRTUAL, no params
+    // and the exported symbol `CSurfacePassElement::opaqueRegion()` (nm -DC /usr/bin/Hyprland).
+    // Different convention from drawSurface: it RETURNS a non-trivially-copyable CRegion by
+    // value, so the Itanium ABI returns it through a hidden caller-allocated slot passed in
+    // rdi, with `this` moved to rsi (confirmed by disassembling the installed function:
+    // rdi is kept as the result slot, [rsi+0x50] is read as m_data.surface). A free function
+    // `CRegion f(void*)` lowers identically (sret in rdi, the void* in rsi), so declaring the
+    // same C++ return type on both sides gives a matching ABI. Hooking the function body
+    // (rather than the vtable slot) covers every virtual dispatch, since the vtable points at
+    // this body; CSurfacePassElement has single, non-virtual inheritance from IPassElement,
+    // so `this` is the CSurfacePassElement* with no adjustment.
+    //
+    // Why: with `decoration:rounding = 0`, m_data.rounding is 0, so the original reports the
+    // whole window box as opaque. CRenderPass::simplify() then subtracts that from the damage
+    // of everything underneath (wallpaper, other windows, the clear pass), so the corner
+    // cutouts our drawSurface hook leaves are never repainted and show black/stale content.
+    // We subtract each live corner's box from the reported region so the backdrop under the
+    // corners is drawn again. Making the opaque region SMALLER is always safe: it can only
+    // cause extra (correct) drawing underneath, never missing drawing.
+    using opaqueRegion_t = CRegion (*)(void* thisptr);
+
+    constexpr const char* OPAQUE_DEMANGLED = "CSurfacePassElement::opaqueRegion()";
+
+    CFunctionHook* g_opaqueHook = nullptr;
+
+    CRegion hkOpaqueRegion(void* thisptr) {
+        CRegion region = (*reinterpret_cast<opaqueRegion_t>(g_opaqueHook->m_original))(thisptr);
+        if (region.empty())
+            return region;
+
+        auto*       el   = static_cast<CSurfacePassElement*>(thisptr);
+        const auto& data = el->m_data;
+
+        // Same filter as hkDrawSurface: only main window surfaces our render hook may round.
+        // dontRound surfaces (internal fullscreen) are drawn square by hkDrawSurface, so their
+        // native opaque region is already correct; leave them alone so a fullscreen window
+        // keeps occluding everything beneath it at full efficiency.
+        if (!data.pWindow || !data.mainSurface || data.popup || data.dontRound || !data.pMonitor)
+            return region;
+
+        const auto* corners = SeamState::liveCornersFor(data.pWindow);
+        if (!corners)
+            return region;
+
+        // opaqueRegion() is in monitor-local LOGICAL coordinates (PassElement.hpp); getTexBox()
+        // is the same logical box hkDrawSurface scales/rounds into its windowBox. simplify()
+        // later scales every rect by the monitor scale and rounds it, and hkDrawSurface's own
+        // patches are ceil(radius * scale) scaled px anchored on a rounded edge, so pad each
+        // cut-out by 2 logical px and snap it outward to whole logical px. Over-cutting a sliver
+        // only means a few extra backdrop pixels get painted (then covered by our corner draw);
+        // under-cutting would leave a black/stale fringe.
+        const CBox texBox = el->getTexBox();
+        if (texBox.width <= 0 || texBox.height <= 0)
+            return region;
+
+        auto cut = [&](double radius, bool left, bool top) {
+            if (!(radius > 0.0))
+                return;
+            const double size = std::ceil(radius) + 2.0;
+            const double x0   = std::floor(left ? texBox.x : texBox.x + texBox.width - size);
+            const double y0   = std::floor(top ? texBox.y : texBox.y + texBox.height - size);
+            const double x1   = std::ceil(left ? texBox.x + size : texBox.x + texBox.width);
+            const double y1   = std::ceil(top ? texBox.y + size : texBox.y + texBox.height);
+            region.subtract(CRegion(CBox{x0, y0, x1 - x0, y1 - y0}));
+        };
+
+        cut(corners->topLeft, true, true);
+        cut(corners->topRight, false, true);
+        cut(corners->bottomLeft, true, false);
+        cut(corners->bottomRight, false, false);
+
+        return region;
+    }
 } // namespace
 
 namespace {
@@ -364,10 +442,38 @@ bool SeamHook::install() {
     }
 
     Log::logger->log(Log::DEBUG, "[hypr-seam] drawSurface hook installed @ {}", target);
+
+    // opaqueRegion hook (black/stale-corner fix). Not fatal if it can't be installed: the
+    // corners still render, they just may show black/stale content behind opaque windows.
+    // Warn loudly instead of tearing down the working render hook.
+    void*         opaqueTarget = nullptr;
+    const eLookup opaqueLookup = findExact("opaqueRegion", OPAQUE_DEMANGLED, opaqueTarget);
+    if (opaqueLookup != eLookup::FOUND) {
+        const std::string msg = opaqueLookup == eLookup::AMBIGUOUS ? "[hypr-seam] Found more than one exact match for CSurfacePassElement::opaqueRegion — not hooking it; corners may show black/stale content." :
+                                                                     "[hypr-seam] Could not locate CSurfacePassElement::opaqueRegion — corners may show black/stale content.";
+        Log::logger->log(Log::ERR, "{}", msg);
+        HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.0, 0.6, 0.2, 1.0}, 8000);
+        return true;
+    }
+
+    g_opaqueHook = HyprlandAPI::createFunctionHook(PHANDLE, opaqueTarget, reinterpret_cast<void*>(&hkOpaqueRegion));
+    if (!g_opaqueHook || !g_opaqueHook->hook()) {
+        Log::logger->log(Log::ERR, "[hypr-seam] failed to install opaqueRegion hook");
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook opaqueRegion — corners may show black/stale content.", CHyprColor{1.0, 0.6, 0.2, 1.0}, 8000);
+        if (g_opaqueHook)
+            HyprlandAPI::removeFunctionHook(PHANDLE, g_opaqueHook);
+        g_opaqueHook = nullptr;
+        return true;
+    }
+
+    Log::logger->log(Log::DEBUG, "[hypr-seam] opaqueRegion hook installed @ {}", opaqueTarget);
     return true;
 }
 
 void SeamHook::remove() {
+    if (g_opaqueHook)
+        HyprlandAPI::removeFunctionHook(PHANDLE, g_opaqueHook);
+    g_opaqueHook = nullptr;
     if (g_hook)
         HyprlandAPI::removeFunctionHook(PHANDLE, g_hook);
     g_hook        = nullptr;
