@@ -1,16 +1,12 @@
 # hypr-seam
 
-A Hyprland plugin that replaces native window-corner rounding with
-independent, per-corner rounding, and adds an optional `seam` effect: when
-two tiled windows meet edge to edge, the corner where they touch flattens
-to a small radius instead of staying fully round. The windows start to look
-like two facing pages of an open book, rounded on the outside, meeting at a
-flat spine down the middle, rather than a single rounded-off grid line. The
-effect also handles T-junctions and X-junctions, where three or four
-windows meet at one point, flattening that shared corner on every window
-involved. Floating windows are untouched by any of this: they keep ordinary
-rounding and never participate in seam detection, either as the window
-being flattened or as a neighbor that causes another window to flatten.
+A Hyprland plugin for independent per-corner rounding, plus an optional
+seam effect: the corner where two tiled windows touch flattens out instead
+of staying round, so your layout reads as one continuous shape instead of
+a grid of separate rounded boxes. T-junctions and X-junctions, where three
+or four windows meet at a point, flatten the same way across every window
+involved. Both base rounding and the seam effect can be set per app, so
+your terminal can stay sharp-cornered while everything else gets rounded.
 
 ## Demo
 
@@ -93,6 +89,22 @@ exists, otherwise `plugin:seam:enabled`. Floating windows skip seam
 resolution entirely and always render with base rounding only, regardless
 of what the seam flag would otherwise resolve to.
 
+### Example
+
+A plain hyprlang `.conf` snippet covering the common options:
+
+```
+plugin:seam:enabled = true
+plugin:seam:rounding = 12
+plugin:seam:seam_radius = 2
+plugin:seam:tolerance = 6
+plugin:seam:animate = true
+plugin:seam:animation_speed = 300
+
+seamrule = rounding 4 4 22 22, class:^(kitty)$
+seamrule = seam 0, class:^(foot)$
+```
+
 ### Per-app rules (`seamrule`)
 
 Hyprland's plugin API has no hook into the native `windowrulev2` engine, so
@@ -130,32 +142,15 @@ than silently doing nothing.
 
 ## Scope and limitations
 
-- Only the window's own content is re-rounded. Border-pass and shadow-pass
-  rounding aren't implemented yet. If you run with borders or shadows
-  enabled, expect their corners to stay square-ish or mismatched against
-  the content rounding this plugin draws.
-- Blur-aware corner compositing isn't implemented yet either. The
-  rendering hook already has access to the window's blurred backdrop
-  texture at the point it runs, so this is expected to be a small addition
-  later, not a redesign, but it isn't there now.
-- Adjacency is recomputed on layout-changing events (window open/close/move,
-  floating toggle, fullscreen, workspace switch, monitor changes), not
-  every frame, so corners can be briefly stale mid-drag until the next
-  event fires. This matches how Hyprland's own layout updates behave.
-- By default only a window's main surface is rounded, not its subsurfaces.
-  Firefox-based browsers (Firefox, Zen, and others) draw the whole window
-  into a subsurface that covers the main surface exactly, so the rounded
-  main surface is hidden and the window looks square. Set
-  `plugin:seam:force_round_risky_surfaces = true` to also round any
-  subsurface at the window corners it shares with the window. A subsurface
-  that doesn't reach a window corner (an embedded video, for example) is
-  never rounded. This is off by default because it changes how other
-  apps' subsurfaces are drawn, and it has only been tested with Firefox.
+- hypr-seam only rounds a window's main surface by default, not its
+  subsurfaces. Any window that renders through a subsurface covering the
+  whole main surface, which is how GPU-accelerated apps such as
+  Firefox-based browsers (Firefox, Zen, and others) draw, will keep square
+  corners: the rounding is there, just hidden underneath. If you hit this,
+  set `plugin:seam:force_round_risky_surfaces = true` to also round
+  subsurfaces where they reach a window's corners. A subsurface that
+  doesn't reach a corner, an embedded video for example, is never touched
+  either way. This is off by default because it changes how other apps'
+  subsurfaces get drawn, and it has only been tested against Firefox.
   During a resize animation the subsurface can briefly lag the window box,
-  so its corners can show square for a few frames.
-- Windows in a Hyprland window group (a tabbed stack) currently flatten all
-  four corners against each other, since inactive group members occupy the
-  same box as the active one and the plugin doesn't yet know to exclude
-  them from adjacency. If you use groups, expect grouped windows to show
-  fully flattened corners rather than their normal rounding. A fix is
-  identified but not yet implemented.
+  so its corners may show square for a few frames.
