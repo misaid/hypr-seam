@@ -220,6 +220,8 @@ static void registerSeamConfig() {
     vars.animationCurve      = makeShared<Config::Values::CStringValue>("plugin:seam:animation_curve", "Bezier curve name", "default");
     vars.forceRoundRiskySurfaces =
         makeShared<Config::Values::CBoolValue>("plugin:seam:force_round_risky_surfaces", "Also round subsurfaces that reach a window corner (Firefox/Zen page content)", false);
+    vars.roundBorders = makeShared<Config::Values::CBoolValue>("plugin:seam:round_borders", "Round the native border to match this window's live corner radii", false);
+    vars.roundShadows = makeShared<Config::Values::CBoolValue>("plugin:seam:round_shadows", "Round the native drop shadow to match this window's live corner radii", false);
 
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.rounding);
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.roundingTopLeft);
@@ -234,6 +236,8 @@ static void registerSeamConfig() {
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.animationSpeed);
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.animationCurve);
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.forceRoundRiskySurfaces);
+    HyprlandAPI::addConfigValueV2(PHANDLE, vars.roundBorders);
+    HyprlandAPI::addConfigValueV2(PHANDLE, vars.roundShadows);
 
     // Per-app rules have two entry points, one per config flavour; both are always
     // attempted (additive), but each API only succeeds under its own config manager:
