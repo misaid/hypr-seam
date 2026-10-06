@@ -67,3 +67,6 @@ Testing/
 .cache/
 
 .worktrees/
+
+# superpowers plan execution scratch (ledger, briefs, review packages)
+.superpowers/
