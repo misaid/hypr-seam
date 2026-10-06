@@ -5,31 +5,31 @@
 #include <vector>
 
 struct SCornerRadii {
-    double topLeft;
-    double topRight;
-    double bottomLeft;
-    double bottomRight;
+    double topLeft     = 0.0;
+    double topRight    = 0.0;
+    double bottomLeft  = 0.0;
+    double bottomRight = 0.0;
 };
 
 struct SGlobalSeamDefaults {
     SCornerRadii baseRadii;
-    double       roundingPower;
-    bool         seamEnabled;
-    double       seamRadius;
-    double       tolerance;
+    double       roundingPower = 0.0;
+    bool         seamEnabled   = false;
+    double       seamRadius    = 0.0;
+    double       tolerance     = 0.0;
 };
 
 struct SSeamRule {
-    bool          isSeamDirective; // true = "seam <0|1>" rule, false = "rounding tl tr bl br" rule
-    SCornerRadii  radii;           // valid when !isSeamDirective
-    bool          seamOn;          // valid when isSeamDirective
+    bool          isSeamDirective = false; // true = "seam <0|1>" rule, false = "rounding tl tr bl br" rule
+    SCornerRadii  radii;                   // valid when !isSeamDirective
+    bool          seamOn          = false; // valid when isSeamDirective
     std::string   classPattern;    // ECMAScript regex source, matched against window class; empty = don't care
     std::string   titlePattern;    // ECMAScript regex source, matched against window title; empty = don't care
 };
 
 struct SResolvedWindowConfig {
     SCornerRadii radii;
-    bool         seamEnabled;
+    bool         seamEnabled = false;
 };
 
 // Pure resolution: later-registered rules win on conflict (last match wins),

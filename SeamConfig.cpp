@@ -2,30 +2,37 @@
 #include <regex>
 #include <sstream>
 
-static bool patternMatches(const std::string& pattern, const std::string& subject, bool& matched) {
+namespace {
+struct SPatternMatchResult {
+    bool ok;      // false iff this field has a malformed pattern, or a valid pattern that didn't match
+    bool matched; // true iff this field carried a real (non-empty) constraint
+};
+
+SPatternMatchResult patternMatches(const std::string& pattern, const std::string& subject) {
     if (pattern.empty())
-        return true; // this field is unconstrained by the rule
+        return {true, false}; // this field is unconstrained by the rule
     std::regex re;
     try {
         re = std::regex(pattern);
     } catch (const std::regex_error&) {
-        return false; // malformed pattern: treat the whole rule as invalid, skip rather than crash
+        return {false, false}; // malformed pattern: treat the whole rule as invalid, skip rather than crash
     }
-    matched = true;
-    return std::regex_search(subject, re);
+    return {std::regex_search(subject, re), true};
 }
+} // namespace
 
 SResolvedWindowConfig resolveWindowConfig(const std::string& windowClass, const std::string& windowTitle, bool isFloating,
                                           const SGlobalSeamDefaults& defaults, const std::vector<SSeamRule>& rules) {
     SResolvedWindowConfig result{.radii = defaults.baseRadii, .seamEnabled = defaults.seamEnabled};
 
     for (const auto& rule : rules) {
-        bool anyPattern = false;
-        if (!patternMatches(rule.classPattern, windowClass, anyPattern))
+        const auto classResult = patternMatches(rule.classPattern, windowClass);
+        if (!classResult.ok)
             continue;
-        if (!patternMatches(rule.titlePattern, windowTitle, anyPattern))
+        const auto titleResult = patternMatches(rule.titlePattern, windowTitle);
+        if (!titleResult.ok)
             continue;
-        if (!anyPattern)
+        if (!classResult.matched && !titleResult.matched)
             continue; // a rule with no matcher at all never matches
 
         if (rule.isSeamDirective)
@@ -77,7 +84,7 @@ bool parseSeamRuleLine(const std::string& value, SSeamRule& outRule) {
     iss >> keyword;
 
     if (keyword == "seam") {
-        int val;
+        int val{};
         if (!(iss >> val) || !(iss >> std::ws).eof())
             return false;
         outRule.isSeamDirective = true;
@@ -86,7 +93,7 @@ bool parseSeamRuleLine(const std::string& value, SSeamRule& outRule) {
     }
 
     if (keyword == "rounding") {
-        double tl, tr, bl, br;
+        double tl{}, tr{}, bl{}, br{};
         if (!(iss >> tl >> tr >> bl >> br) || !(iss >> std::ws).eof())
             return false;
         outRule.isSeamDirective = false;

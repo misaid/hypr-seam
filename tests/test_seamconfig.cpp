@@ -115,7 +115,24 @@ static void test_parse_trailing_garbage_fails() {
     CHECK(rule.classPattern == "^(foot)$");
 }
 
+// Regression test for a latent UB hazard: bare `SSeamRule rule;` (no braces,
+// as used by onSeamRule() in main.cpp before parseSeamRuleLine fills it) must
+// deterministically default-initialize every scalar member via SSeamRule's
+// default member initializers, not leave bool/double fields indeterminate.
+static void test_default_constructed_rule_has_safe_defaults() {
+    SSeamRule rule;
+    CHECK(rule.isSeamDirective == false);
+    CHECK(rule.seamOn == false);
+    CHECK(rule.radii.topLeft == 0.0);
+    CHECK(rule.radii.topRight == 0.0);
+    CHECK(rule.radii.bottomLeft == 0.0);
+    CHECK(rule.radii.bottomRight == 0.0);
+    CHECK(rule.classPattern.empty());
+    CHECK(rule.titlePattern.empty());
+}
+
 int main() {
+    test_default_constructed_rule_has_safe_defaults();
     test_title_rule_matches_by_title_only();
     test_class_and_title_both_required_when_both_set();
     test_rule_without_any_pattern_never_matches();
