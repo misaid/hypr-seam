@@ -2,6 +2,7 @@
 
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 
+#include <optional>
 #include <string>
 
 // Tracks every mapped window's live, animated corner-radius state and keeps it in
@@ -27,11 +28,11 @@ namespace SeamState {
     void recomputeAll();
 
     // Per-window live corner radii, read every frame by the render hook (Task 7).
-    // Returns nullptr if the window isn't tracked (shouldn't happen for mapped windows).
-    SLiveCorners* liveCornersFor(PHLWINDOW window);
+    // Returns std::nullopt if the window isn't tracked (shouldn't happen for mapped windows).
+    std::optional<SLiveCorners> liveCornersFor(const PHLWINDOW& window);
 
-    void onWindowOpened(PHLWINDOW window);
-    void onWindowClosed(PHLWINDOW window);
+    void onWindowOpened(const PHLWINDOW& window);
+    void onWindowClosed(const PHLWINDOW& window);
 
     // Drops every tracked window entry (and its animated variables) and cancels
     // any pending deferred recompute. Called from PLUGIN_EXIT so no window refs,

@@ -34,6 +34,9 @@ struct SWindowEntry {
     bool              wasTouching[4] = {false, false, false, false}; // TL, TR, BL, BR
 };
 
+// g_entries/g_lastFingerprint/g_pendingCloseRecompute below are plain unsynchronized
+// module state: safe only because Hyprland always dispatches plugin event-bus
+// callbacks (and `tick`) from its single main thread, never concurrently.
 std::unordered_map<PHLWINDOW, SWindowEntry> g_entries;
 
 // Fingerprint of every mapped window's position/size/floating state, used by
@@ -172,7 +175,7 @@ void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>&
 // can skip the full O(n^2) recompute on ticks where nothing moved.
 std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const std::vector<const CWorkspace*>& workspaces) {
     std::size_t hash = boxes.size();
-    auto        mix  = [&hash](std::size_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2); };
+    auto        mix  = [&hash](std::size_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL /* splitmix64-style mix constant */ + (hash << 6) + (hash >> 2); };
     for (size_t i = 0; i < boxes.size(); ++i) {
         const auto& b = boxes[i];
         mix(std::hash<double>{}(b.x));
@@ -185,9 +188,61 @@ std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const 
     return hash;
 }
 
+// Seam is off for this window (globally, by rule, or because it's floating):
+// use plain per-corner base radii and drop any stale hysteresis state so a
+// later re-enable (e.g. a config reload or rule change) starts clean.
+void retargetDisabled(SWindowEntry& entry, const SResolvedWindowConfig& resolved, const SSeamBox& subjectBox) {
+    entry.wasTouching[0] = entry.wasTouching[1] = entry.wasTouching[2] = entry.wasTouching[3] = false;
+
+    retarget(entry.topLeft, clampCornerRadius(resolved.radii.topLeft, subjectBox.w, subjectBox.h));
+    retarget(entry.topRight, clampCornerRadius(resolved.radii.topRight, subjectBox.w, subjectBox.h));
+    retarget(entry.bottomLeft, clampCornerRadius(resolved.radii.bottomLeft, subjectBox.w, subjectBox.h));
+    retarget(entry.bottomRight, clampCornerRadius(resolved.radii.bottomRight, subjectBox.w, subjectBox.h));
+}
+
+void retargetEnabled(SWindowEntry& entry, const SResolvedWindowConfig& resolved, const SSeamBox& subjectBox, const std::vector<SSeamBox>& pool,
+                      const SGlobalSeamDefaults& defaults) {
+    const SCornerFlags touching = computeTouchingCorners(subjectBox, pool, defaults.tolerance);
+
+    // Hysteresis: once a corner is flagged as touching, don't drop the flag the
+    // instant the normal-tolerance check fails — only drop it once a *widened*
+    // tolerance check also fails, i.e. once the gap has clearly grown past the
+    // boundary rather than merely crossed it. (The reverse direction — going
+    // from unflagged to flagged — always uses the normal tolerance immediately;
+    // hysteresis only guards against flicker on the way out.)
+    const SCornerFlags widened = computeTouchingCorners(subjectBox, pool, defaults.tolerance * 1.5);
+
+    auto resolveCorner = [&](bool rawTouching, bool widenedTouching, bool& wasTouching, double baseRadius) {
+        bool effectiveTouching;
+        if (rawTouching)
+            effectiveTouching = true;
+        else if (wasTouching)
+            effectiveTouching = widenedTouching;
+        else
+            effectiveTouching = false;
+
+        wasTouching = effectiveTouching;
+        return effectiveTouching ? defaults.seamRadius : baseRadius;
+    };
+
+    const double tl =
+        resolveCorner(touching.topLeft, widened.topLeft, entry.wasTouching[0], clampCornerRadius(resolved.radii.topLeft, subjectBox.w, subjectBox.h));
+    const double tr =
+        resolveCorner(touching.topRight, widened.topRight, entry.wasTouching[1], clampCornerRadius(resolved.radii.topRight, subjectBox.w, subjectBox.h));
+    const double bl = resolveCorner(touching.bottomLeft, widened.bottomLeft, entry.wasTouching[2],
+                                    clampCornerRadius(resolved.radii.bottomLeft, subjectBox.w, subjectBox.h));
+    const double br = resolveCorner(touching.bottomRight, widened.bottomRight, entry.wasTouching[3],
+                                    clampCornerRadius(resolved.radii.bottomRight, subjectBox.w, subjectBox.h));
+
+    retarget(entry.topLeft, tl);
+    retarget(entry.topRight, tr);
+    retarget(entry.bottomLeft, bl);
+    retarget(entry.bottomRight, br);
+}
+
 } // namespace
 
-void SeamState::onWindowOpened(PHLWINDOW window) {
+void SeamState::onWindowOpened(const PHLWINDOW& window) {
     if (!window || g_entries.contains(window))
         return;
 
@@ -205,7 +260,7 @@ void SeamState::onWindowOpened(PHLWINDOW window) {
     recomputeAll();
 }
 
-void SeamState::onWindowClosed(PHLWINDOW window) {
+void SeamState::onWindowClosed(const PHLWINDOW& window) {
     g_entries.erase(window);
 
     // The closed window's former neighbors may have just lost a touching corner
@@ -231,14 +286,12 @@ void SeamState::clear() {
     g_lastFingerprint = 0;
 }
 
-SeamState::SLiveCorners* SeamState::liveCornersFor(PHLWINDOW window) {
+std::optional<SeamState::SLiveCorners> SeamState::liveCornersFor(const PHLWINDOW& window) {
     auto it = g_entries.find(window);
     if (it == g_entries.end())
-        return nullptr;
+        return std::nullopt;
 
-    static SLiveCorners out; // single scratch instance; caller reads it immediately, never stores the pointer
-    out = {it->second.topLeft->value(), it->second.topRight->value(), it->second.bottomLeft->value(), it->second.bottomRight->value()};
-    return &out;
+    return SLiveCorners{it->second.topLeft->value(), it->second.topRight->value(), it->second.bottomLeft->value(), it->second.bottomRight->value()};
 }
 
 void SeamState::recomputeAll() {
@@ -285,56 +338,10 @@ void SeamState::recomputeAll() {
 
         auto resolved = resolveWindowConfig(w->m_class, w->m_title, w->m_isFloating, defaults, SeamRuleStore::rules());
 
-        if (!resolved.seamEnabled) {
-            // Seam is off for this window (globally, by rule, or because it's floating):
-            // use plain per-corner base radii and drop any stale hysteresis state so a
-            // later re-enable (e.g. a config reload or rule change) starts clean.
-            entry.wasTouching[0] = entry.wasTouching[1] = entry.wasTouching[2] = entry.wasTouching[3] = false;
-
-            retarget(entry.topLeft, clampCornerRadius(resolved.radii.topLeft, subjectBox.w, subjectBox.h));
-            retarget(entry.topRight, clampCornerRadius(resolved.radii.topRight, subjectBox.w, subjectBox.h));
-            retarget(entry.bottomLeft, clampCornerRadius(resolved.radii.bottomLeft, subjectBox.w, subjectBox.h));
-            retarget(entry.bottomRight, clampCornerRadius(resolved.radii.bottomRight, subjectBox.w, subjectBox.h));
-            continue;
-        }
-
-        const auto&        pool     = pools[workspaces[i]];
-        const SCornerFlags touching = computeTouchingCorners(subjectBox, pool, defaults.tolerance);
-
-        // Hysteresis: once a corner is flagged as touching, don't drop the flag the
-        // instant the normal-tolerance check fails — only drop it once a *widened*
-        // tolerance check also fails, i.e. once the gap has clearly grown past the
-        // boundary rather than merely crossed it. (The reverse direction — going
-        // from unflagged to flagged — always uses the normal tolerance immediately;
-        // hysteresis only guards against flicker on the way out.)
-        const SCornerFlags widened = computeTouchingCorners(subjectBox, pool, defaults.tolerance * 1.5);
-
-        auto resolveCorner = [&](bool rawTouching, bool widenedTouching, bool& wasTouching, double baseRadius) {
-            bool effectiveTouching;
-            if (rawTouching)
-                effectiveTouching = true;
-            else if (wasTouching)
-                effectiveTouching = widenedTouching;
-            else
-                effectiveTouching = false;
-
-            wasTouching = effectiveTouching;
-            return effectiveTouching ? defaults.seamRadius : baseRadius;
-        };
-
-        const double tl =
-            resolveCorner(touching.topLeft, widened.topLeft, entry.wasTouching[0], clampCornerRadius(resolved.radii.topLeft, subjectBox.w, subjectBox.h));
-        const double tr =
-            resolveCorner(touching.topRight, widened.topRight, entry.wasTouching[1], clampCornerRadius(resolved.radii.topRight, subjectBox.w, subjectBox.h));
-        const double bl = resolveCorner(touching.bottomLeft, widened.bottomLeft, entry.wasTouching[2],
-                                        clampCornerRadius(resolved.radii.bottomLeft, subjectBox.w, subjectBox.h));
-        const double br = resolveCorner(touching.bottomRight, widened.bottomRight, entry.wasTouching[3],
-                                        clampCornerRadius(resolved.radii.bottomRight, subjectBox.w, subjectBox.h));
-
-        retarget(entry.topLeft, tl);
-        retarget(entry.topRight, tr);
-        retarget(entry.bottomLeft, bl);
-        retarget(entry.bottomRight, br);
+        if (!resolved.seamEnabled)
+            retargetDisabled(entry, resolved, subjectBox);
+        else
+            retargetEnabled(entry, resolved, subjectBox, pools[workspaces[i]], defaults);
     }
 }
 
