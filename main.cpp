@@ -16,11 +16,24 @@
 #include <string>
 #include <vector>
 
+#include <array>
+
 #include "globals.hpp"
 #include "SeamConfig.hpp"
 #include "SeamRuleStore.hpp"
 #include "SeamState.hpp"
 #include "SeamHook.hpp"
+
+namespace {
+    // Shared notification styling. kErrorColor is reused across every hard-failure
+    // notification (version mismatch, failed rule registration, malformed Lua rule);
+    // the two timeouts are genuinely distinct durations in the UI, not duplicates of
+    // each other: short-lived init status toasts use kShortNotifyTimeoutMs, while
+    // diagnostic/error messages the user may need longer to read use kNotifyTimeoutMs.
+    const CHyprColor kErrorColor{1.0, 0.2, 0.2, 1.0};
+    constexpr int     kNotifyTimeoutMs      = 8000;
+    constexpr int     kShortNotifyTimeoutMs = 5000;
+}
 
 // Do NOT change this function.
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -85,7 +98,7 @@ namespace {
             rule.radii           = {r, r, r, r};
             out.push_back(rule);
         } else if (lua_type(L, -1) == LUA_TTABLE) {
-            double v[4];
+            std::array<double, 4> v{};
             for (int i = 0; i < 4 && ok; ++i) {
                 lua_rawgeti(L, -1, i + 1);
                 if (lua_type(L, -1) != LUA_TNUMBER)
@@ -167,7 +180,7 @@ namespace {
             if (auto* mgr = Config::Lua::CConfigManager::fromLuaState(L))
                 mgr->addError(std::string{msg});
             else
-                HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] " + msg, CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+                HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] " + msg, kErrorColor, kNotifyTimeoutMs);
             return 0;
         }
 
@@ -238,7 +251,7 @@ static void registerSeamConfig() {
         HyprlandAPI::addNotification(PHANDLE,
                                      isLua ? "[hypr-seam] Failed to register hl.plugin.seam.rule — per-app seam rules will not work (see hyprland.log)." :
                                              "[hypr-seam] Failed to register the seamrule keyword — per-app seam rules will not work.",
-                                     CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+                                     kErrorColor, kNotifyTimeoutMs);
     }
 
     HyprlandAPI::reloadConfig();
@@ -276,31 +289,32 @@ static void checkNativeRoundingIsZero() {
     if (*PROUNDING != 0) {
         HyprlandAPI::addNotification(
             PHANDLE, "[hypr-seam] decoration:rounding is not 0 — this plugin fully replaces native rounding and requires it. Set decoration:rounding = 0.",
-            CHyprColor{1.0, 0.6, 0.0, 1.0}, 8000);
+            CHyprColor{1.0, 0.6, 0.0, 1.0}, kNotifyTimeoutMs);
     }
 }
 
-APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
-    PHANDLE = handle;
-
-    const std::string HASH        = __hyprland_api_get_hash();
-    const std::string CLIENT_HASH = __hyprland_api_get_client_hash();
-
-    if (HASH != CLIENT_HASH) {
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failure in initialization: Version mismatch (headers ver is not equal to running hyprland ver)",
-                                     CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
-        throw std::runtime_error("[hypr-seam] Version mismatch");
-    }
-
-    registerSeamConfig();
-    checkNativeRoundingIsZero();
-
-    // Hyprlang re-invokes the `seamrule` keyword handler (and a Lua config re-runs its
-    // hl.plugin.seam.rule calls) for every rule on each config reload, but never
-    // clears state our plugin owns (SeamRuleStore) — so without this, rules
-    // re-parsed on reload would simply append onto the old ones forever. Clear on
-    // preReload (emitted by both config managers before the config is re-run),
-    // and re-check the rounding guard on reloaded (after the new values land).
+// Hyprlang re-invokes the `seamrule` keyword handler (and a Lua config re-runs its
+// hl.plugin.seam.rule calls) for every rule on each config reload, but never
+// clears state our plugin owns (SeamRuleStore) — so without this, rules
+// re-parsed on reload would simply append onto the old ones forever. Clear on
+// preReload (emitted by both config managers before the config is re-run),
+// and re-check the rounding guard on reloaded (after the new values land).
+//
+// Also covers window tracking + adjacency recompute triggers (Task 5). Event names
+// below were confirmed against the installed <hyprland/src/event/EventBus.hpp>
+// rather than trusted from the plan verbatim:
+//   - window.open / window.close: exist exactly as named.
+//   - window.move / window.changeFloatingMode / window.fullscreen /
+//     workspace.active: "window.move" does NOT exist (there is no standalone
+//     window-move/resize event at all); "changeFloatingMode" doesn't exist
+//     either — the real member is "window.floating". "window.fullscreen" and
+//     "workspace.active" exist exactly as named.
+//   - monitor add/remove/move: real members are monitor.added, monitor.removed,
+//     monitor.layoutChanged (used here for monitor rearrangement/"move").
+// For the missing window-move/resize event, we follow the plan's documented
+// fallback: recompute from a general per-tick callback, gated by a cheap dirty
+// check (SeamState::onTick()) so idle ticks stay nearly free.
+static void registerEventListeners() {
     g_listeners.emplace_back(Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); }));
     // Also recompute on full config reload (e.g. `hyprctl reload` after editing
     // seamrule lines, radii, or plugin:seam:enabled in the config file) — without
@@ -321,21 +335,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // harmless to keep regardless, in case other config-change paths do fire it.
     g_listeners.emplace_back(Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); }));
 
-    // Window tracking + adjacency recompute triggers (Task 5).
-    //
-    // Event names below were confirmed against the installed
-    // <hyprland/src/event/EventBus.hpp> rather than trusted from the plan verbatim:
-    //   - window.open / window.close: exist exactly as named.
-    //   - window.move / window.changeFloatingMode / window.fullscreen /
-    //     workspace.active: "window.move" does NOT exist (there is no standalone
-    //     window-move/resize event at all); "changeFloatingMode" doesn't exist
-    //     either — the real member is "window.floating". "window.fullscreen" and
-    //     "workspace.active" exist exactly as named.
-    //   - monitor add/remove/move: real members are monitor.added, monitor.removed,
-    //     monitor.layoutChanged (used here for monitor rearrangement/"move").
-    // For the missing window-move/resize event, we follow the plan's documented
-    // fallback: recompute from a general per-tick callback, gated by a cheap dirty
-    // check (SeamState::onTick()) so idle ticks stay nearly free.
     g_listeners.emplace_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
@@ -346,35 +345,58 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_listeners.emplace_back(Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.monitor.layoutChanged.listen([]() { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.tick.listen([]() { SeamState::onTick(); }));
+}
 
-    // Attach to every window already open at load time (the plugin can be
-    // hot-loaded into a running session with windows already present).
-    // Includes windows hidden at load time (e.g. inactive members of a window group):
-    // they never fire window.open again when un-hidden, so skipping them here would leave
-    // them untracked (and square-cornered) until reopened.
+// Attach to every window already open at load time (the plugin can be
+// hot-loaded into a running session with windows already present).
+// Includes windows hidden at load time (e.g. inactive members of a window group):
+// they never fire window.open again when un-hidden, so skipping them here would leave
+// them untracked (and square-cornered) until reopened.
+static void attachExistingWindows() {
     for (auto& w : Desktop::windowState()->windows()) {
         if (!validMapped(w))
             continue;
         SeamState::onWindowOpened(w);
     }
+}
 
-    // Diagnostic dispatcher (`hyprctl dispatch seam:debugstate`): shows a notification
-    // (and writes the same text to hyprland.log) listing every tracked window's live
-    // corner radii, '*' marking corners currently flagged as touching a neighbor. Not
-    // used by the render path; kept on purpose as a troubleshooting aid for bug reports.
+// Diagnostic dispatcher (`hyprctl dispatch seam:debugstate`): shows a notification
+// (and writes the same text to hyprland.log) listing every tracked window's live
+// corner radii, '*' marking corners currently flagged as touching a neighbor. Not
+// used by the render path; kept on purpose as a troubleshooting aid for bug reports.
+static void registerDebugDispatcher() {
     HyprlandAPI::addDispatcherV2(PHANDLE, "seam:debugstate", [](std::string) -> SDispatchResult {
         const auto dump = SeamState::debugDump();
         Log::logger->log(Log::INFO, "[hypr-seam debugstate]\n{}", dump);
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + dump, CHyprColor{0.4, 0.7, 1.0, 1.0}, 8000);
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + dump, CHyprColor{0.4, 0.7, 1.0, 1.0}, kNotifyTimeoutMs);
         return {};
     });
+}
+
+APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    PHANDLE = handle;
+
+    const std::string HASH        = __hyprland_api_get_hash();
+    const std::string CLIENT_HASH = __hyprland_api_get_client_hash();
+
+    if (HASH != CLIENT_HASH) {
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failure in initialization: Version mismatch (headers ver is not equal to running hyprland ver)",
+                                     kErrorColor, kShortNotifyTimeoutMs);
+        throw std::runtime_error("[hypr-seam] Version mismatch");
+    }
+
+    registerSeamConfig();
+    checkNativeRoundingIsZero();
+    registerEventListeners();
+    attachExistingWindows();
+    registerDebugDispatcher();
 
     // Per-corner rendering hook on Render::IElementRenderer::drawSurface (SeamHook.cpp).
     // On failure install() has already shown a notification; the plugin stays
     // loaded but inert for rendering.
     SeamHook::install();
 
-    HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Initialized successfully!", CHyprColor{0.2, 1.0, 0.2, 1.0}, 5000);
+    HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Initialized successfully!", CHyprColor{0.2, 1.0, 0.2, 1.0}, kShortNotifyTimeoutMs);
 
     return {"hypr-seam", "Per-corner window rounding with a book-seam adjacency flag.", "misaid", "0.1"};
 }
