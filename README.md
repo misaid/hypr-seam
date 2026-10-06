@@ -14,7 +14,7 @@ being flattened or as a neighbor that causes another window to flatten.
 
 ## Demo
 
-<!-- TODO: add a real demo screenshot or GIF of the plugin running in Hyprland -->
+![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
 
 ## Requirements
 
