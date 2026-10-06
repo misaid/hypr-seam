@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <vector>
 
 struct SSeamBox {
@@ -15,4 +16,7 @@ struct SCornerFlags {
 // reach, `tolerance` before un-flagging) is applied by the caller across repeated
 // calls — see SeamState.cpp.
 SCornerFlags computeTouchingCorners(const SSeamBox& subject, const std::vector<SSeamBox>& all, double tolerance);
-double clampCornerRadius(double radius, double width, double height);
+
+constexpr double clampCornerRadius(double radius, double width, double height) {
+    return std::min({radius, width / 2.0, height / 2.0});
+}

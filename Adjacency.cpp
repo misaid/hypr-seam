@@ -33,7 +33,3 @@ SCornerFlags computeTouchingCorners(const SSeamBox& subject, const std::vector<S
 
     return flags;
 }
-
-double clampCornerRadius(double radius, double width, double height) {
-    return std::min({radius, width / 2.0, height / 2.0});
-}
