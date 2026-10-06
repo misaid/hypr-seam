@@ -129,6 +129,77 @@ namespace {
         return SCornerPatch{CBox{x, y, size, size}, round};
     }
 
+    struct SCornerPatches {
+        SCornerPatch topLeft, topRight, bottomLeft, bottomRight;
+    };
+
+    SCornerPatches computeCornerPatches(const CBox& windowBox, const SeamState::SLiveCorners& radii, double scale) {
+        return SCornerPatches{
+            makeCornerPatch(windowBox, true, true, radii.topLeft, scale),
+            makeCornerPatch(windowBox, false, true, radii.topRight, scale),
+            makeCornerPatch(windowBox, true, false, radii.bottomLeft, scale),
+            makeCornerPatch(windowBox, false, false, radii.bottomRight, scale),
+        };
+    }
+
+    // Subtracts each non-empty corner patch's box from `savedDamage`, producing the region
+    // the main body should actually paint into (everything except the 4 corner squares).
+    CRegion pruneDamageForPatches(const CRegion& savedDamage, const SCornerPatches& patches) {
+        CRegion pruned = savedDamage.copy();
+        if (patches.topLeft.round > 0)
+            pruned.subtract(CRegion(patches.topLeft.box));
+        if (patches.topRight.round > 0)
+            pruned.subtract(CRegion(patches.topRight.box));
+        if (patches.bottomLeft.round > 0)
+            pruned.subtract(CRegion(patches.bottomLeft.box));
+        if (patches.bottomRight.round > 0)
+            pruned.subtract(CRegion(patches.bottomRight.box));
+        return pruned;
+    }
+
+    struct SUVMapping {
+        Vector2D topLeft, bottomRight;
+    };
+
+    // Redraws each corner with its own live radius, restricted to just that corner's box via
+    // a damage region containing only it (intersected with what was actually damaged this
+    // frame). Hyprland's own rounded-rect shader (invoked once per corner with that corner's
+    // own radius) is the per-corner-radius mechanism — no custom GLSL needed.
+    void drawCorners(const SCornerPatches& patches, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const CRegion& savedDamage,
+                      const SUVMapping& uv, float roundingPower) {
+        auto        PSURFACE = Desktop::View::CWLSurface::fromResource(data.surface);
+        const float ALPHA    = data.alpha * data.fadeAlpha * (PSURFACE ? PSURFACE->m_alphaModifier : 1.F);
+        const float OVERALLA = PSURFACE ? PSURFACE->m_overallOpacity : 1.F;
+
+        auto drawCorner = [&](const SCornerPatch& patch) {
+            if (patch.round <= 0)
+                return;
+
+            CRegion cornerRegion = savedDamage.copy().intersect(CRegion(patch.box));
+            if (cornerRegion.empty())
+                return;
+
+            Render::GL::g_pHyprOpenGL->renderTexture(data.texture, windowBox,
+                                                      Render::GL::CHyprOpenGLImpl::STextureRenderData{
+                                                          .damage        = &cornerRegion,
+                                                          .surface       = data.surface,
+                                                          .a             = ALPHA * OVERALLA,
+                                                          .round         = patch.round,
+                                                          .roundingPower = roundingPower,
+                                                          .allowCustomUV = true,
+                                                          .wrapX         = data.wrapX,
+                                                          .wrapY         = data.wrapY,
+                                                          .primarySurfaceUVTopLeft     = uv.topLeft,
+                                                          .primarySurfaceUVBottomRight = uv.bottomRight,
+                                                      });
+        };
+
+        drawCorner(patches.topLeft);
+        drawCorner(patches.topRight);
+        drawCorner(patches.bottomLeft);
+        drawCorner(patches.bottomRight);
+    }
+
     bool forceRoundRiskySurfaces() {
         return vars.forceRoundRiskySurfaces && vars.forceRoundRiskySurfaces->value();
     }
@@ -182,6 +253,27 @@ namespace {
             (!data.pLS || (!data.pLS->sizeAnimation()->isBeingAnimated()));
     }
 
+    // Reproduces the exact UV mapping the body paint just used. drawSurface computes it via
+    // calculateUVForSurface into m_renderData.primarySurfaceUV* and then resets those back
+    // to (-1,-1) in a scope guard on exit, so it's gone by now — recompute it with the very
+    // same arguments drawSurface passed (same windowBox, unscaled tex-box size, and our
+    // exact MISALIGNEDFSV1 replica), read it out, and put the globals back to the "no
+    // custom UV" state drawSurface left them in. This covers every case calculateUV
+    // handles (viewporter source crops, expand_undersized_textures, the resize/animation
+    // RATIO crop, fractional-scale misalignment) without guessing, so the corners always
+    // sample the same texels as the body right next to them — including during
+    // open/resize/reflow animations, where the buffer size lags the animated box on
+    // nearly every frame.
+    SUVMapping recomputeUV(void* thisptr, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const Vector2D& projSizeUnscaled,
+                           Render::SRenderData& renderData) {
+        (*g_calculateUV)(thisptr, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled,
+                          misalignedFSv1(data, windowBox));
+        const SUVMapping uv{renderData.primarySurfaceUVTopLeft, renderData.primarySurfaceUVBottomRight};
+        renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+        renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+        return uv;
+    }
+
     void hkDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
         // Never .lock() this WP: it points at a UP<>-owned render-pass element, and
         // WP::lock() hard-asserts over a CUniquePointer (docs/hook-notes.md). Use
@@ -229,7 +321,7 @@ namespace {
             return;
         }
 
-        const auto* corners = SeamState::liveCornersFor(data.pWindow);
+        const auto corners = SeamState::liveCornersFor(data.pWindow);
         if (!corners) {
             callOriginal();
             return;
@@ -273,10 +365,7 @@ namespace {
         const float  roundingPower = *PPOWER;
         const double scale         = data.pMonitor->m_scale;
 
-        const SCornerPatch patchTL = makeCornerPatch(windowBox, true, true, radii.topLeft, scale);
-        const SCornerPatch patchTR = makeCornerPatch(windowBox, false, true, radii.topRight, scale);
-        const SCornerPatch patchBL = makeCornerPatch(windowBox, true, false, radii.bottomLeft, scale);
-        const SCornerPatch patchBR = makeCornerPatch(windowBox, false, false, radii.bottomRight, scale);
+        const SCornerPatches patches = computeCornerPatches(windowBox, radii, scale);
 
         // Save the actual region the original draws into (the `damage` parameter is never
         // read by drawSurface — confirmed in docs/hook-notes.md), subtract the 4 corner
@@ -287,17 +376,7 @@ namespace {
         const CRegion savedDamage    = renderData.damage;
         const bool    savedDontRound = data.dontRound;
 
-        CRegion prunedDamage = savedDamage.copy();
-        if (patchTL.round > 0)
-            prunedDamage.subtract(CRegion(patchTL.box));
-        if (patchTR.round > 0)
-            prunedDamage.subtract(CRegion(patchTR.box));
-        if (patchBL.round > 0)
-            prunedDamage.subtract(CRegion(patchBL.box));
-        if (patchBR.round > 0)
-            prunedDamage.subtract(CRegion(patchBR.box));
-
-        renderData.damage = prunedDamage;
+        renderData.damage = pruneDamageForPatches(savedDamage, patches);
         data.dontRound    = true;
 
         callOriginal();
@@ -305,59 +384,10 @@ namespace {
         renderData.damage = savedDamage;
         data.dontRound    = savedDontRound;
 
-        // Reproduce the exact UV mapping the body paint just used. drawSurface computes it via
-        // calculateUVForSurface into m_renderData.primarySurfaceUV* and then resets those back
-        // to (-1,-1) in a scope guard on exit, so it's gone by now — recompute it with the very
-        // same arguments drawSurface passed (same windowBox, unscaled tex-box size, and our
-        // exact MISALIGNEDFSV1 replica), read it out, and put the globals back to the "no
-        // custom UV" state drawSurface left them in. This covers every case calculateUV
-        // handles (viewporter source crops, expand_undersized_textures, the resize/animation
-        // RATIO crop, fractional-scale misalignment) without guessing, so the corners always
-        // sample the same texels as the body right next to them — including during
-        // open/resize/reflow animations, where the buffer size lags the animated box on
-        // nearly every frame.
-        const Vector2D projSizeUnscaled = el->getTexBox().size();
-        (*g_calculateUV)(thisptr, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled, misalignedFSv1(data, windowBox));
-        const Vector2D uvTopLeft            = renderData.primarySurfaceUVTopLeft;
-        const Vector2D uvBottomRight        = renderData.primarySurfaceUVBottomRight;
-        renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
-        renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+        const Vector2D   projSizeUnscaled = el->getTexBox().size();
+        const SUVMapping uv               = recomputeUV(thisptr, data, windowBox, projSizeUnscaled, renderData);
 
-        // Redraw each corner with its own live radius, restricted to just that corner's box
-        // via a damage region containing only it (intersected with what was actually damaged
-        // this frame). Hyprland's own rounded-rect shader (invoked once per corner with that
-        // corner's own radius) is the per-corner-radius mechanism — no custom GLSL needed.
-        auto PSURFACE          = Desktop::View::CWLSurface::fromResource(data.surface);
-        const float ALPHA      = data.alpha * data.fadeAlpha * (PSURFACE ? PSURFACE->m_alphaModifier : 1.F);
-        const float OVERALLA   = PSURFACE ? PSURFACE->m_overallOpacity : 1.F;
-
-        auto drawCorner = [&](const SCornerPatch& patch) {
-            if (patch.round <= 0)
-                return;
-
-            CRegion cornerRegion = savedDamage.copy().intersect(CRegion(patch.box));
-            if (cornerRegion.empty())
-                return;
-
-            Render::GL::g_pHyprOpenGL->renderTexture(data.texture, windowBox,
-                                                      Render::GL::CHyprOpenGLImpl::STextureRenderData{
-                                                          .damage        = &cornerRegion,
-                                                          .surface       = data.surface,
-                                                          .a             = ALPHA * OVERALLA,
-                                                          .round         = patch.round,
-                                                          .roundingPower = roundingPower,
-                                                          .allowCustomUV = true,
-                                                          .wrapX         = data.wrapX,
-                                                          .wrapY         = data.wrapY,
-                                                          .primarySurfaceUVTopLeft     = uvTopLeft,
-                                                          .primarySurfaceUVBottomRight = uvBottomRight,
-                                                      });
-        };
-
-        drawCorner(patchTL);
-        drawCorner(patchTR);
-        drawCorner(patchBL);
-        drawCorner(patchBR);
+        drawCorners(patches, data, windowBox, savedDamage, uv, roundingPower);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -406,7 +436,7 @@ namespace {
         if (!data.mainSurface && !forceRoundRiskySurfaces())
             return region;
 
-        const auto* corners = SeamState::liveCornersFor(data.pWindow);
+        const auto corners = SeamState::liveCornersFor(data.pWindow);
         if (!corners)
             return region;
 
@@ -447,58 +477,66 @@ namespace {
 
 namespace {
     enum class eLookup {
-        FOUND,
-        NOT_FOUND,
-        AMBIGUOUS,
+        Found,
+        NotFound,
+        Ambiguous,
     };
 
-    // Finds exactly one function whose demangled name equals `demangled`. Refuses (AMBIGUOUS)
+    const CHyprColor kErrorColor{1.0, 0.2, 0.2, 1.0};
+    const CHyprColor kWarnColor{1.0, 0.6, 0.2, 1.0};
+    constexpr int     kNotifyTimeoutMs = 8000;
+
+    struct SLookupResult {
+        eLookup status;
+        void*   address = nullptr;
+    };
+
+    // Finds exactly one function whose demangled name equals `demangled`. Refuses (Ambiguous)
     // rather than guessing if more than one exact match exists.
-    eLookup findExact(const std::string& shortName, const char* demangled, void*& out) {
-        out = nullptr;
+    SLookupResult findExact(const std::string& shortName, const char* demangled) {
+        void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
             Log::logger->log(Log::DEBUG, "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
             if (m.demangled != demangled)
                 continue;
-            if (out) {
-                out = nullptr;
-                return eLookup::AMBIGUOUS;
-            }
-            out = m.address;
+            if (found)
+                return SLookupResult{eLookup::Ambiguous};
+            found = m.address;
         }
-        return out ? eLookup::FOUND : eLookup::NOT_FOUND;
+        return found ? SLookupResult{eLookup::Found, found} : SLookupResult{eLookup::NotFound};
     }
 
     bool reportLookupFailure(eLookup result, const std::string& what) {
-        if (result == eLookup::FOUND)
+        if (result == eLookup::Found)
             return false;
 
-        const std::string msg = result == eLookup::AMBIGUOUS ?
+        const std::string msg = result == eLookup::Ambiguous ?
             std::format("[hypr-seam] Found more than one exact match for {} — refusing to guess which to use. Rendering will not work.", what) :
             std::format("[hypr-seam] Could not locate {} to hook — rendering will not work.", what);
         Log::logger->log(Log::ERR, "{}", msg);
-        HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+        HyprlandAPI::addNotification(PHANDLE, msg, kErrorColor, kNotifyTimeoutMs);
         return true;
     }
 }
 
 bool SeamHook::install() {
-    void* target = nullptr;
-    if (reportLookupFailure(findExact("drawSurface", TARGET_DEMANGLED, target), "drawSurface"))
+    const auto drawSurfaceLookup = findExact("drawSurface", TARGET_DEMANGLED);
+    if (reportLookupFailure(drawSurfaceLookup.status, "drawSurface"))
         return false;
+    void* target = drawSurfaceLookup.address;
 
     // Required too: without it the corner patches can't reproduce the body's UV mapping (see
     // hkDrawSurface), so don't install the render hook at all rather than draw mismatched
     // corners.
-    void* calcUV = nullptr;
-    if (reportLookupFailure(findExact("calculateUVForSurface", CALCUV_DEMANGLED, calcUV), "calculateUVForSurface"))
+    const auto calcUVLookup = findExact("calculateUVForSurface", CALCUV_DEMANGLED);
+    if (reportLookupFailure(calcUVLookup.status, "calculateUVForSurface"))
         return false;
-    g_calculateUV = reinterpret_cast<calculateUV_t>(calcUV);
+    g_calculateUV = reinterpret_cast<calculateUV_t>(calcUVLookup.address);
 
     g_hook = HyprlandAPI::createFunctionHook(PHANDLE, target, reinterpret_cast<void*>(&hkDrawSurface));
     if (!g_hook || !g_hook->hook()) {
         Log::logger->log(Log::ERR, "[hypr-seam] failed to install drawSurface hook");
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook drawSurface — rendering will not work.", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook drawSurface — rendering will not work.", kErrorColor, kNotifyTimeoutMs);
         if (g_hook)
             HyprlandAPI::removeFunctionHook(PHANDLE, g_hook);
         g_hook        = nullptr;
@@ -511,20 +549,20 @@ bool SeamHook::install() {
     // opaqueRegion hook (black/stale-corner fix). Not fatal if it can't be installed: the
     // corners still render, they just may show black/stale content behind opaque windows.
     // Warn loudly instead of tearing down the working render hook.
-    void*         opaqueTarget = nullptr;
-    const eLookup opaqueLookup = findExact("opaqueRegion", OPAQUE_DEMANGLED, opaqueTarget);
-    if (opaqueLookup != eLookup::FOUND) {
-        const std::string msg = opaqueLookup == eLookup::AMBIGUOUS ? "[hypr-seam] Found more than one exact match for CSurfacePassElement::opaqueRegion — not hooking it; corners may show black/stale content." :
-                                                                     "[hypr-seam] Could not locate CSurfacePassElement::opaqueRegion — corners may show black/stale content.";
+    const auto  opaqueLookup = findExact("opaqueRegion", OPAQUE_DEMANGLED);
+    void* const opaqueTarget = opaqueLookup.address;
+    if (opaqueLookup.status != eLookup::Found) {
+        const std::string msg = opaqueLookup.status == eLookup::Ambiguous ? "[hypr-seam] Found more than one exact match for CSurfacePassElement::opaqueRegion — not hooking it; corners may show black/stale content." :
+                                                                             "[hypr-seam] Could not locate CSurfacePassElement::opaqueRegion — corners may show black/stale content.";
         Log::logger->log(Log::ERR, "{}", msg);
-        HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.0, 0.6, 0.2, 1.0}, 8000);
+        HyprlandAPI::addNotification(PHANDLE, msg, kWarnColor, kNotifyTimeoutMs);
         return true;
     }
 
     g_opaqueHook = HyprlandAPI::createFunctionHook(PHANDLE, opaqueTarget, reinterpret_cast<void*>(&hkOpaqueRegion));
     if (!g_opaqueHook || !g_opaqueHook->hook()) {
         Log::logger->log(Log::ERR, "[hypr-seam] failed to install opaqueRegion hook");
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook opaqueRegion — corners may show black/stale content.", CHyprColor{1.0, 0.6, 0.2, 1.0}, 8000);
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Failed to hook opaqueRegion — corners may show black/stale content.", kWarnColor, kNotifyTimeoutMs);
         if (g_opaqueHook)
             HyprlandAPI::removeFunctionHook(PHANDLE, g_opaqueHook);
         g_opaqueHook = nullptr;
