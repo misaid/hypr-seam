@@ -79,6 +79,8 @@ All values live under the `plugin:seam:` prefix.
 | `plugin:seam:animation_speed` | float (ms) | `300` | Duration of that easing transition. |
 | `plugin:seam:animation_curve` | string | `"default"` | Name of a bezier curve already registered via Hyprland's `bezier =` (or `hl.curve(...)`). |
 | `plugin:seam:force_round_risky_surfaces` | bool | `false` | Also round a window's subsurfaces where they reach the window's own corners. Turn this on if Firefox-based browsers (Firefox, Zen, ...) keep square corners. See below. |
+| `plugin:seam:round_borders` | bool | `false` | Round the native border to match this window's live corner radii (including seam flattening). Requires `general:border_size > 0`. |
+| `plugin:seam:round_shadows` | bool | `false` | Round the native drop shadow to match this window's live corner radii (including seam flattening). Requires `decoration:shadow:enabled = true`. |
 
 Base corner radii resolve per window: a matching `seamrule rounding`
 override, or else the four global `rounding_*` values. The seam flag
@@ -159,3 +161,8 @@ mistakes.
   subsurfaces, and it has only been tested against Firefox. During a
   resize animation the subsurface can briefly lag the window box, showing
   square corners for a few frames.
+- Border and shadow rounding are opt-in (`plugin:seam:round_borders`,
+  `plugin:seam:round_shadows`), since they re-render Hyprland's own
+  border/shadow passes per corner, the same technique used for window
+  content. Off by default; a window's border/shadow stays native (square,
+  if `decoration:rounding = 0`) until you turn them on.

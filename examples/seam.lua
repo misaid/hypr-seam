@@ -68,6 +68,15 @@ hl.config({
             -- Off by default because it affects how every app's
             -- subsurfaces are drawn.
             force_round_risky_surfaces = false,
+
+            -- Off by default. Round the native border to match this
+            -- window's live corner radii (including seam flattening).
+            -- Only visible with general.border_size > 0.
+            round_borders = false,
+
+            -- Off by default. Round the native drop shadow the same way.
+            -- Only visible with decoration.shadow.enabled = true.
+            round_shadows = false,
         },
     },
 })
