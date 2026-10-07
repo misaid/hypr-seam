@@ -38,8 +38,8 @@ then the resulting `build/libhypr-seam.so` is copied to `hypr-seam.so`).
 
 ### Manual build
 
-The repo also has a plain `Makefile` wrapping a `meson`/`ninja` build, for
-building outside of `hyprpm`:
+The repo also includes a plain `Makefile` that wraps a `meson`/`ninja`
+build, for building outside `hyprpm`:
 
 ```sh
 git clone https://github.com/misaid/hypr-seam
@@ -128,10 +128,10 @@ seamrule = seam 0, class:^(foot)$                   # opt out even if plugin:sea
 seamrule = seam 0, title:^Picture-in-Picture$       # match by title instead of class
 ```
 
-`rounding` rules and `seam` rules are independent, so an app can get both:
-two `seamrule` lines for the same `class:`/`title:` match, one `rounding`
-and one `seam`, apply together. Later rules win on conflict, same as
-`windowrulev2`.
+`rounding` rules and `seam` rules are independent: an app can have one
+`seamrule rounding` line and one `seamrule seam` line for the same
+`class:`/`title:` match, and both apply. Later rules win on conflict, same
+as `windowrulev2`.
 
 For Hyprland's Lua config DSL, use `hl.plugin.seam.rule(...)` instead,
 which takes either a `seamrule` string or a table:
