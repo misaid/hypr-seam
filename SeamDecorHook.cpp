@@ -51,6 +51,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <concepts>
 #include <format>
 #include <string>
 
@@ -87,7 +88,7 @@ namespace {
     // render call for one corner's box/round. Reaches for g_pHyprRenderer->m_renderData
     // directly (same as hkDrawSurface does) rather than naming its type as a parameter --
     // SeamHook.cpp never names that type either, it only ever accesses it through `auto&`.
-    template <typename F>
+    template <std::invocable<const SCornerBox&> F>
     void forEachCorner(const SCornerBoxes& boxes, const CRegion& savedDamage, F&& draw) {
         auto& renderData = g_pHyprRenderer->m_renderData;
         auto  redraw      = [&](const SCornerBox& patch) {

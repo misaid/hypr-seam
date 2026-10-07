@@ -274,7 +274,7 @@ static void registerSeamConfig() {
 // than risk the same silent non-match this is meant to fix. A real false-touching cost would
 // only show up for a deliberately tiny seam_radius with an unusually large intentional gap;
 // anyone who wants that sets plugin:seam:tolerance explicitly and this is bypassed entirely.
-double resolveTolerance() {
+static double resolveTolerance() {
     const Config::INTEGER val = vars.tolerance->value();
     if (val >= 0)
         return static_cast<double>(val);
