@@ -38,6 +38,17 @@ hyprpm enable hypr-seam
 `hyprpm` builds the plugin using the manifest's build script (`make all`,
 then the resulting `build/libhypr-seam.so` is copied to `hypr-seam.so`).
 
+`hyprpm enable` only loads it for the current session. To load it on every
+Hyprland start, add this to your config:
+
+```ini
+exec-once = hyprpm reload -n
+```
+
+(`-n` suppresses the "unstable plugin" notification on every launch.) One
+`hyprpm reload -n` line covers every plugin you've enabled through hyprpm,
+not just this one.
+
 ### Manual build
 
 The repo also includes a plain `Makefile` that wraps a `meson`/`ninja`
