@@ -3,6 +3,7 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
@@ -13,6 +14,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -215,7 +217,7 @@ static void registerSeamConfig() {
     vars.roundingPower       = makeShared<Config::Values::CFloatValue>("plugin:seam:rounding_power", "Squircle exponent", 2.0F);
     vars.enabled             = makeShared<Config::Values::CBoolValue>("plugin:seam:enabled", "Global seam master switch", false);
     vars.seamRadius          = makeShared<Config::Values::CIntValue>("plugin:seam:seam_radius", "Radius a flattened corner collapses to", 2);
-    vars.tolerance           = makeShared<Config::Values::CIntValue>("plugin:seam:tolerance", "Max px gap still considered touching", 6);
+    vars.tolerance           = makeShared<Config::Values::CIntValue>("plugin:seam:tolerance", "Max px gap still considered touching, or -1 to derive it from general:gaps_in", -1);
     vars.animate             = makeShared<Config::Values::CBoolValue>("plugin:seam:animate", "Ease corner radius changes", true);
     vars.animationSpeed      = makeShared<Config::Values::CFloatValue>("plugin:seam:animation_speed", "Transition duration in ms", 300.0F);
     vars.animationCurve      = makeShared<Config::Values::CStringValue>("plugin:seam:animation_curve", "Bezier curve name", "default");
@@ -262,6 +264,30 @@ static void registerSeamConfig() {
     HyprlandAPI::reloadConfig();
 }
 
+// plugin:seam:tolerance left at its default (-1) derives a touch-tolerance from
+// general:gaps_in instead of a fixed px value, so two tiled windows at the layout's own
+// default spacing are recognized as touching without the user needing to discover and tune
+// tolerance themselves. The actual on-screen gap between two dwindle/master siblings runs
+// wider than gaps_in alone (border_size adds to it too, and the exact relationship isn't a
+// clean documented multiple), so this errs generous -- measured gaps of 12-26px against
+// gaps_in values of 4-10px (with border_size 2-3px) all land comfortably inside 3x+6 -- rather
+// than risk the same silent non-match this is meant to fix. A real false-touching cost would
+// only show up for a deliberately tiny seam_radius with an unusually large intentional gap;
+// anyone who wants that sets plugin:seam:tolerance explicitly and this is bypassed entirely.
+double resolveTolerance() {
+    const Config::INTEGER val = vars.tolerance->value();
+    if (val >= 0)
+        return static_cast<double>(val);
+
+    static auto PGAPSIN = CConfigValue<Config::IComplexConfigValue>("general:gaps_in");
+    const auto* gaps    = dynamic_cast<const Config::CCssGapData*>(PGAPSIN.ptr());
+    if (!gaps)
+        return 8.0;
+
+    const int64_t maxGap = std::max({gaps->m_top, gaps->m_right, gaps->m_bottom, gaps->m_left});
+    return std::max<double>(8.0, static_cast<double>(maxGap) * 3.0 + 6.0);
+}
+
 // Builds the resolved global seam defaults from the live plugin:seam:* config values.
 // Non-static (declared in globals.hpp) so other translation units can call it directly.
 SGlobalSeamDefaults currentGlobalDefaults() {
@@ -283,7 +309,7 @@ SGlobalSeamDefaults currentGlobalDefaults() {
         .roundingPower = static_cast<double>(vars.roundingPower->value()),
         .seamEnabled   = vars.enabled->value(),
         .seamRadius    = static_cast<double>(vars.seamRadius->value()),
-        .tolerance     = static_cast<double>(vars.tolerance->value()),
+        .tolerance     = resolveTolerance(),
     };
 }
 

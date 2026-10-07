@@ -45,9 +45,11 @@ hl.config({
             seam_radius = 2,
 
             -- Maximum gap, in pixels, between two window edges that still
-            -- counts as "touching" for seam purposes. Covers gaps_in plus
-            -- floating-point/scale slop.
-            tolerance = 6,
+            -- counts as "touching" for seam purposes. -1 (the default)
+            -- derives this from general.gaps_in automatically; set an
+            -- explicit value only if the auto default doesn't match your
+            -- layout.
+            tolerance = -1,
 
             -- Eases a corner's radius between its base and seam values
             -- instead of snapping instantly when adjacency changes.

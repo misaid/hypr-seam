@@ -74,7 +74,7 @@ All values live under the `plugin:seam:` prefix.
 | `plugin:seam:rounding_power` | float | `2.0` | Squircle exponent for the corner curve, matching Hyprland's native default look. |
 | `plugin:seam:enabled` | bool | `false` | Global master switch for the seam effect. |
 | `plugin:seam:seam_radius` | int | `2` | Radius a corner collapses to once it's flagged as touching a neighboring tiled window. |
-| `plugin:seam:tolerance` | int (px) | `6` | Maximum gap between two window edges that still counts as "touching." Covers `gaps_in` plus floating-point/scale slop. |
+| `plugin:seam:tolerance` | int (px) | `-1` | Maximum gap between two window edges that still counts as "touching." `-1` (default) derives it from `general:gaps_in` automatically; set a specific value to override. |
 | `plugin:seam:animate` | bool | `true` | Eases a corner's radius between its base and seam values instead of snapping. |
 | `plugin:seam:animation_speed` | float (ms) | `300` | Duration of that easing transition. |
 | `plugin:seam:animation_curve` | string | `"default"` | Name of a bezier curve already registered via Hyprland's `bezier =` (or `hl.curve(...)`). |
@@ -96,7 +96,6 @@ A plain hyprlang `.conf` snippet covering the common options:
 plugin:seam:enabled = true
 plugin:seam:rounding = 12
 plugin:seam:seam_radius = 2
-plugin:seam:tolerance = 6
 plugin:seam:animate = true
 plugin:seam:animation_speed = 300
 
