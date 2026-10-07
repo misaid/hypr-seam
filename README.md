@@ -12,6 +12,8 @@ your terminal can stay sharp-cornered while everything else gets rounded.
 
 ![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
 
+[Demo video](assets/demo.mp4)
+
 ## Requirements
 
 - Hyprland, built and tested against the 0.56.2 internal ABI. The plugin
