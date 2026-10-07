@@ -14,16 +14,14 @@ your terminal can stay sharp-cornered while everything else gets rounded.
 
 ## Requirements
 
-- Hyprland, currently built and tested against the 0.56.2 internal ABI.
-  The plugin hooks an internal, version-unstable Hyprland function
-  (`createFunctionHook`, the same facility other community plugins such as
-  `hy3` use), so a Hyprland upgrade that changes that function's signature
-  will need a matching plugin update, not just a rebuild.
-- `decoration:rounding = 0` set globally in your Hyprland config. This
-  plugin fully replaces native corner rendering, scissoring out each
-  corner before Hyprland's own paint call and redrawing it itself, so
-  leaving native rounding on would just double up with (or fight) this
-  plugin's own rounding.
+- Hyprland, built and tested against the 0.56.2 internal ABI. The plugin
+  hooks an internal, version-unstable function (`createFunctionHook`, also
+  used by plugins like `hy3`), so a Hyprland update that changes that
+  function's signature needs a matching plugin update, not just a rebuild.
+- `decoration:rounding = 0` set globally. This plugin replaces native
+  corner rendering: it scissors out each corner before Hyprland's paint
+  call and redraws it itself, so leaving native rounding on just doubles
+  up with (or fights) this plugin's own rounding.
 
 ## Installation
 
@@ -82,12 +80,11 @@ All values live under the `plugin:seam:` prefix.
 | `plugin:seam:animation_curve` | string | `"default"` | Name of a bezier curve already registered via Hyprland's `bezier =` (or `hl.curve(...)`). |
 | `plugin:seam:force_round_risky_surfaces` | bool | `false` | Also round a window's subsurfaces where they reach the window's own corners. Turn this on if Firefox-based browsers (Firefox, Zen, ...) keep square corners. See below. |
 
-Base corner radii are resolved per window as: a matching `seamrule rounding`
-override if one exists, otherwise the four global `rounding_*` values. The
-seam flag resolves the same way: a matching `seamrule seam` override if one
-exists, otherwise `plugin:seam:enabled`. Floating windows skip seam
-resolution entirely and always render with base rounding only, regardless
-of what the seam flag would otherwise resolve to.
+Base corner radii resolve per window: a matching `seamrule rounding`
+override, or else the four global `rounding_*` values. The seam flag
+resolves the same way, via `seamrule seam` or else `plugin:seam:enabled`.
+Floating windows always skip seam resolution and render with base
+rounding only.
 
 ### Example
 
@@ -105,12 +102,15 @@ seamrule = rounding 4 4 22 22, class:^(kitty)$
 seamrule = seam 0, class:^(foot)$
 ```
 
+A fuller version of this file, with every option set to its default and
+commented, lives at [`examples/seam.conf`](examples/seam.conf); the Lua
+DSL equivalent is at [`examples/seam.lua`](examples/seam.lua).
+
 ### Per-app rules (`seamrule`)
 
-Hyprland's plugin API has no hook into the native `windowrulev2` engine, so
-`hypr-seam` parses its own keyword, `seamrule`, using the same
-`class:`/`title:` match syntax as `windowrulev2`. This works for a plain
-hyprlang `.conf`-syntax config:
+Hyprland's plugin API has no hook into `windowrulev2`, so `hypr-seam`
+parses its own keyword, `seamrule`, using the same `class:`/`title:` match
+syntax. For a plain hyprlang `.conf` config:
 
 ```
 seamrule = rounding <tl> <tr> <bl> <br>, <match>
@@ -120,15 +120,21 @@ seamrule = seam <0|1>, <match>
 Examples:
 
 ```
-seamrule = rounding 4 4 22 22, class:^(kitty)$
-seamrule = seam 1, class:^(mpv)$
-seamrule = seam 0, class:^(foot)$   # opt out even if plugin:seam:enabled = true
+seamrule = rounding 4 4 22 22, class:^(kitty)$      # sharp top corners, rounded bottom
+seamrule = rounding 0 0 0 0, class:^(discord)$      # fully square, regardless of global rounding
+seamrule = rounding 16 16 16 16, class:^(obsidian)$ # its own uniform radius, independent of the global one
+seamrule = seam 1, class:^(mpv)$                    # always flattens, even if plugin:seam:enabled = false
+seamrule = seam 0, class:^(foot)$                   # opt out even if plugin:seam:enabled = true
+seamrule = seam 0, title:^Picture-in-Picture$       # match by title instead of class
 ```
 
-If your config is written in Hyprland's Lua config DSL instead (no plain
-`.conf` file for `seamrule` to live in), use `hl.plugin.seam.rule(...)`,
-which accepts either the exact same string a `seamrule` line would take, or
-a table:
+`rounding` rules and `seam` rules are independent, so an app can get both:
+two `seamrule` lines for the same `class:`/`title:` match, one `rounding`
+and one `seam`, apply together. Later rules win on conflict, same as
+`windowrulev2`.
+
+For Hyprland's Lua config DSL, use `hl.plugin.seam.rule(...)` instead,
+which takes either a `seamrule` string or a table:
 
 ```lua
 hl.plugin.seam.rule("seam 0, class:^(foot)$")
@@ -136,21 +142,20 @@ hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
 hl.plugin.seam.rule({ title = "^Picture-in-Picture$", seam = false })
 ```
 
-A malformed rule (either form) shows up as a config error with a file/line
-reference, the same way Hyprland reports its own config mistakes, rather
-than silently doing nothing.
+A malformed rule, in either form, shows up as a config error with a
+file/line reference, the same way Hyprland reports its own config
+mistakes.
 
 ## Scope and limitations
 
 - hypr-seam only rounds a window's main surface by default, not its
-  subsurfaces. Any window that renders through a subsurface covering the
-  whole main surface, which is how GPU-accelerated apps such as
-  Firefox-based browsers (Firefox, Zen, and others) draw, will keep square
-  corners: the rounding is there, just hidden underneath. If you hit this,
-  set `plugin:seam:force_round_risky_surfaces = true` to also round
-  subsurfaces where they reach a window's corners. A subsurface that
-  doesn't reach a corner, an embedded video for example, is never touched
-  either way. This is off by default because it changes how other apps'
-  subsurfaces get drawn, and it has only been tested against Firefox.
-  During a resize animation the subsurface can briefly lag the window box,
-  so its corners may show square for a few frames.
+  subsurfaces. GPU-accelerated apps like Firefox-based browsers (Firefox,
+  Zen, and others) draw into a subsurface that covers the main surface
+  exactly, so the rounding is there but hidden and the window looks
+  square. Set `plugin:seam:force_round_risky_surfaces = true` to also
+  round subsurfaces where they reach a window's corners; a subsurface
+  that doesn't reach a corner, like an embedded video, is never touched.
+  This is off by default since it changes how other apps draw their
+  subsurfaces, and it has only been tested against Firefox. During a
+  resize animation the subsurface can briefly lag the window box, showing
+  square corners for a few frames.
