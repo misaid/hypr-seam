@@ -1,5 +1,5 @@
 // tests/test_adjacency.cpp
-#include "../Adjacency.hpp"
+#include "../src/Adjacency.hpp"
 #include <cassert>
 #include <cstdio>
 #include <vector>

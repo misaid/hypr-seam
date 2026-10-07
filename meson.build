@@ -6,13 +6,13 @@ hyprland = dependency('hyprland')
 pixman = dependency('pixman-1')
 
 sources = [
-  'main.cpp',
-  'SeamConfig.cpp',
-  'SeamRuleStore.cpp',
-  'Adjacency.cpp',
-  'SeamState.cpp',
-  'SeamHook.cpp',
-  'SeamDecorHook.cpp',
+  'src/main.cpp',
+  'src/SeamConfig.cpp',
+  'src/SeamRuleStore.cpp',
+  'src/Adjacency.cpp',
+  'src/SeamState.cpp',
+  'src/SeamHook.cpp',
+  'src/SeamDecorHook.cpp',
 ]
 
 shared_module('hypr-seam', sources,

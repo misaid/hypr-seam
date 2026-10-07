@@ -1,5 +1,5 @@
 // tests/test_seamconfig.cpp
-#include "../SeamConfig.hpp"
+#include "../src/SeamConfig.hpp"
 #include <cassert>
 #include <cstdio>
 
