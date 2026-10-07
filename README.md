@@ -12,14 +12,14 @@ your terminal can stay sharp-cornered while everything else gets rounded.
 
 ![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
 
-[Demo video](assets/demo.mp4)
+https://github.com/user-attachments/assets/b4e92a3d-2223-406b-b80d-d5382d2eec14
 
 ## Requirements
 
 - Hyprland, built and tested against the 0.56.2 internal ABI. The plugin
   hooks an internal, version-unstable function (`createFunctionHook`, also
   used by plugins like `hy3`), so a Hyprland update that changes that
-  function's signature needs a matching plugin update, not just a rebuild.
+  function's signature needs a matching plugin update.
 - `decoration:rounding = 0` set globally. This plugin fully replaces
   native corner rendering; leaving it on conflicts with the plugin's own
   rounding.
