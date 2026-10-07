@@ -46,8 +46,7 @@ exec-once = hyprpm reload -n
 ```
 
 (`-n` suppresses the "unstable plugin" notification on every launch.) One
-`hyprpm reload -n` line covers every plugin you've enabled through hyprpm,
-not just this one.
+`hyprpm reload -n` line covers every plugin enabled through hyprpm.
 
 ### Manual build
 
