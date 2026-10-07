@@ -21,8 +21,12 @@
 #include <hyprland/src/plugins/HookSystem.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
 #include <hyprland/src/render/pass/ShadowPassElement.hpp>
+#include <hyprland/src/render/decorations/CHyprDropShadowDecoration.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 
 #include <algorithm>
@@ -176,9 +180,98 @@ namespace {
 
     using shadowDraw_t = void (*)(void* thisptr, WP<CShadowPassElement> element, const CRegion& damage);
 
+    bool roundShadowsEnabled() {
+        return vars.roundShadows && vars.roundShadows->value();
+    }
+
+    // CHyprDropShadowDecoration has no public accessor for its owning window, and (confirmed
+    // in Task 1, Step 6) its constructor/destructor are genuinely ambiguous in the dynamic
+    // symbol table (Itanium ABI C1/C2/D0 variants all demangle identically), so a
+    // constructor-hook ownership map can't be built without guessing which address to hook --
+    // this codebase's own findExact refuses to guess. Falls back to box-matching: shrink the
+    // shadow's fullBox by its own `size` on each side and compare against every tracked
+    // window's current frame box, refusing (not guessing) if more than one window matches.
+    PHLWINDOW ownerOf(const CBox& shrunkBox) {
+        PHLWINDOW match;
+        for (auto& w : Desktop::windowState()->windows()) {
+            if (!Desktop::View::validMapped(w))
+                continue;
+            // position()/size() (IGeometric), not raw members -- confirmed against the real
+            // header; this plan's sketch guessed `m_position`/`m_size`, which don't exist
+            // (SeamState.cpp's own collectVisibleWindows already establishes this accessor).
+            const CBox frame = w->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            if (std::abs(frame.x - shrunkBox.x) > vars.tolerance->value() || std::abs(frame.y - shrunkBox.y) > vars.tolerance->value() ||
+                std::abs(frame.width - shrunkBox.width) > vars.tolerance->value() || std::abs(frame.height - shrunkBox.height) > vars.tolerance->value())
+                continue;
+            if (match)
+                return nullptr; // ambiguous -- refuse rather than guess
+            match = w;
+        }
+        return match;
+    }
+
     void hkShadowDraw(void* thisptr, WP<CShadowPassElement> element, const CRegion& damage) {
-        // Filled in by Task 4.
-        (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, element, damage);
+        const auto callOriginal = [&]() { (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, element, damage); };
+
+        if (!roundShadowsEnabled() || element.expired()) {
+            callOriginal();
+            return;
+        }
+
+        auto& data = element.get()->m_data;
+        if (!data.deco) {
+            callOriginal();
+            return;
+        }
+
+        const PHLMONITOR mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        if (!mon) {
+            callOriginal();
+            return;
+        }
+
+        const SShadowRenderData rd = data.deco->getRenderData(mon, data.a);
+        if (!rd.valid) {
+            callOriginal();
+            return;
+        }
+
+        const CBox shrunkBox{rd.fullBox.x + rd.size, rd.fullBox.y + rd.size, rd.fullBox.width - 2 * rd.size, rd.fullBox.height - 2 * rd.size};
+        const PHLWINDOW window = ownerOf(shrunkBox);
+        if (!window) {
+            callOriginal();
+            return;
+        }
+
+        const auto corners = SeamState::liveCornersFor(window);
+        if (!corners) {
+            callOriginal();
+            return;
+        }
+
+        // decoration:shadow:color is a complex (gradient) config value, not a plain
+        // CConfigValue<T> scalar -- confirmed in Task 1, Step 5b. Checked before any damage
+        // mutation/callOriginal(), same as every other early-bail check above: a bail here
+        // must still leave the shadow drawn natively, not half-drawn with corners missing.
+        static auto PSHADOWCOLOR = CConfigValue<Config::IComplexConfigValue>("decoration:shadow:color");
+        const auto* shadowGrad   = dynamic_cast<const Config::CGradientValueData*>(PSHADOWCOLOR.ptr());
+        if (!shadowGrad) {
+            callOriginal();
+            return;
+        }
+
+        const SCornerBoxes boxes = computeCornerBoxes(rd.fullBox, *corners);
+
+        auto&         renderData  = g_pHyprRenderer->m_renderData;
+        const CRegion savedDamage = renderData.damage;
+
+        renderData.damage = pruneDamageForBoxes(savedDamage, boxes);
+        callOriginal();
+        renderData.damage = savedDamage;
+
+        forEachCorner(boxes, savedDamage, [&](const SCornerBox& patch) {
+            Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, rd.roundingPower, rd.size, *shadowGrad, data.a);
+        });
     }
 }
 
