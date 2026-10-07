@@ -12,6 +12,7 @@ sources = [
   'Adjacency.cpp',
   'SeamState.cpp',
   'SeamHook.cpp',
+  'SeamDecorHook.cpp',
 ]
 
 shared_module('hypr-seam', sources,

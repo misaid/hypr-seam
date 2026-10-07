@@ -23,6 +23,7 @@
 #include "SeamRuleStore.hpp"
 #include "SeamState.hpp"
 #include "SeamHook.hpp"
+#include "SeamDecorHook.hpp"
 
 namespace {
     // Shared notification styling. kErrorColor is reused across every hard-failure
@@ -399,6 +400,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // On failure install() has already shown a notification; the plugin stays
     // loaded but inert for rendering.
     SeamHook::install();
+    SeamDecorHook::install();
 
     HyprlandAPI::addNotification(PHANDLE, "[hypr-seam] Initialized successfully!", CHyprColor{0.2, 1.0, 0.2, 1.0}, kShortNotifyTimeoutMs);
 
@@ -411,6 +413,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // window state and its animated variables, then the parsed rules. hl.plugin.seam.rule,
     // the seamrule keyword, the dispatcher, and plugin:seam:* values are all
     // unregistered by Hyprland itself on unload (PluginSystem / onPluginUnload).
+    SeamDecorHook::remove();
     SeamHook::remove();
     g_listeners.clear();
     SeamState::clear();
