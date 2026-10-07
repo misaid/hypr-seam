@@ -319,19 +319,26 @@ namespace {
         callOriginal();
         renderData.damage = savedDamage;
 
-        // getRenderData() set currentWindow for native's own draw; callOriginal()'s reposition()
-        // clears it afterwards (CHyprDropShadowDecoration.cpp), so it must be set again for the
-        // corner redraws to get the same window-cutout the native fill gets.
-        g_pHyprRenderer->m_renderData.currentWindow = window;
-
+        // Deliberately NOT restoring currentWindow here (unlike the native straight pass,
+        // which gets it from its own getRenderData() call via callOriginal()). The shadow
+        // shader's window cutout (renderRoundedShadow in OpenGL.cpp) always sizes itself from
+        // the window's NATIVE rounding -- forced to 0 by this plugin's own required precondition
+        // (decoration:rounding = 0) -- so the cutout is always a hard square, regardless of
+        // what `round` this call passes for the glow shape itself. Restoring currentWindow for
+        // a *rounded* corner redraw subtracts that square cutout from a round glow silhouette,
+        // leaving a small triangular notch of raw background at the exact corner tip where the
+        // round curve and the square cutout disagree (confirmed by reading the cutout math:
+        // OpenGL.cpp ~2412-2438, `cutoutRadius` from `PWINDOW->rounding() * scale`). Skipping
+        // the cutout for corners trades that hard, geometrically-visible notch for a much
+        // smaller cost: a translucent window's corner shadow isn't cut out from directly under
+        // its own (rounded) content there, same as this hook's behavior before the window-cutout
+        // fix was added -- a soft tint under a small rounded sliver, not a hole in the curve.
         forEachCorner(boxes, savedDamage, [&](const SCornerBox& patch) {
             if (animated)
                 Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, roundingPower, scaledRange, grad1, grad2, lerp, data.a);
             else
                 Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, roundingPower, scaledRange, grad2, data.a);
         });
-
-        g_pHyprRenderer->m_renderData.currentWindow.reset();
     }
 } // namespace
 
