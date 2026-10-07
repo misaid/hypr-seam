@@ -18,10 +18,9 @@ your terminal can stay sharp-cornered while everything else gets rounded.
   hooks an internal, version-unstable function (`createFunctionHook`, also
   used by plugins like `hy3`), so a Hyprland update that changes that
   function's signature needs a matching plugin update, not just a rebuild.
-- `decoration:rounding = 0` set globally. This plugin replaces native
-  corner rendering: it restricts each paint call's damage region to one
-  corner at a time and redraws that corner itself, so leaving native
-  rounding on just doubles up with or fights this plugin's own rounding.
+- `decoration:rounding = 0` set globally. This plugin fully replaces
+  native corner rendering; leaving it on conflicts with the plugin's own
+  rounding.
 
 ## Installation
 
