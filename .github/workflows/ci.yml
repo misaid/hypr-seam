@@ -90,6 +90,7 @@ jobs:
       # base branch (without any of the PR's changes) in a scratch directory.
       # Only runs on failure, so the green path costs nothing extra.
       - name: Check out base ref for diagnosis
+        id: base-checkout
         if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request'
         uses: actions/checkout@v4
         with:
@@ -97,7 +98,7 @@ jobs:
           path: ci-base
 
       - name: Diagnose build failure
-        if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request'
+        if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request' && steps.base-checkout.outcome == 'success'
         run: |
           HYPR_VER=$(pkg-config --modversion hyprland)
           {
@@ -114,6 +115,18 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           tail -n 30 /tmp/base-build.log
+
+      # The base checkout itself failed (e.g. network blip), so no verdict is
+      # possible — say so instead of printing a misleading one.
+      - name: Note inconclusive diagnosis
+        if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request' && steps.base-checkout.outcome == 'failure'
+        run: |
+          {
+            echo "## Build-failure diagnosis inconclusive"
+            echo ""
+            echo "The plugin failed to build, but the base branch could not be checked out for comparison,"
+            echo "so no verdict is possible. Inspect the build log above."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Same verdict for pushes to main (including the weekly scheduled run):
       # no PR is involved, so a fresh main failure against a new Hyprland
