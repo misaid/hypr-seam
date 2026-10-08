@@ -1,5 +1,6 @@
 # hypr-seam
 
+![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
 A Hyprland plugin for independent per-corner rounding, plus an optional
 seam effect: the corner where two tiled windows touch flattens out instead
 of staying round, so your layout reads as one continuous shape instead of
@@ -10,7 +11,6 @@ your terminal can stay sharp-cornered while everything else gets rounded.
 
 ## Demo
 
-![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
 
 https://github.com/user-attachments/assets/b4e92a3d-2223-406b-b80d-d5382d2eec14
 
