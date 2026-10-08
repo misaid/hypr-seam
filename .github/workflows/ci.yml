@@ -6,6 +6,15 @@
 #      standard the plugin itself uses (meson.build: cpp_std=c++23),
 #   3. executes every test binary; any failing assertion makes the binary
 #      exit non-zero, which fails the job.
+#   4. on a plugin build failure, diagnoses the cause: it rebuilds the PR's
+#      base branch without the PR's changes. Base builds but PR doesn't = the
+#      PR broke it; both fail = an upstream Hyprland update broke it and the
+#      plugin likely needs updating for the new Hyprland version. The verdict
+#      is written to the job summary so it is obvious at a glance.
+#
+# A weekly scheduled run rebuilds `main` against the latest Hyprland even when
+# no PR is open, so an upstream breakage is noticed promptly instead of only
+# when someone next opens a PR.
 #
 # The job runs inside an Arch Linux container because Hyprland only publishes
 # its plugin headers + pkg-config file (the `hyprland` pacman package) for
@@ -22,6 +31,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  schedule:
+    # Weekly Monday 06:00 UTC: rebuild main against the latest Hyprland so an
+    # upstream breakage is detected even with no PR open.
+    - cron: '0 6 * * 1'
 
 jobs:
   build-and-test:
@@ -53,6 +66,7 @@ jobs:
       # Same command hyprpm runs (hyprpm.toml) and the README documents:
       # meson setup + ninja via the Makefile wrapper.
       - name: Build plugin
+        id: build
         run: make all
 
       # tests/ has no test runner script or meson test() targets; each test is
@@ -70,3 +84,48 @@ jobs:
         run: |
           /tmp/test_adjacency
           /tmp/test_seamconfig
+
+      # If the plugin itself failed to compile on a PR, say plainly whether
+      # the PR or an upstream Hyprland change is the likely cause: rebuild the
+      # base branch (without any of the PR's changes) in a scratch directory.
+      # Only runs on failure, so the green path costs nothing extra.
+      - name: Check out base ref for diagnosis
+        if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: ci-base
+
+      - name: Diagnose build failure
+        if: failure() && steps.build.outcome == 'failure' && github.event_name == 'pull_request'
+        run: |
+          HYPR_VER=$(pkg-config --modversion hyprland)
+          {
+            echo "## Build-failure diagnosis (Hyprland ${HYPR_VER})"
+            echo ""
+            if make -C ci-base all > /tmp/base-build.log 2>&1; then
+              echo "The base branch (\`${{ github.base_ref }}\`) still builds, but this PR does not."
+              echo "Conclusion: this PR broke the build — the cause is in the PR's changes, not in Hyprland."
+            else
+              echo "The base branch (\`${{ github.base_ref }}\`) fails to build too, with none of this PR's changes present."
+              echo "Conclusion: an upstream Hyprland update (now at ${HYPR_VER}) likely broke the build."
+              echo "The plugin hooks Hyprland's internal, version-unstable API (see README), so it probably"
+              echo "needs to be updated/redesigned for the new Hyprland version."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 30 /tmp/base-build.log
+
+      # Same verdict for pushes to main (including the weekly scheduled run):
+      # no PR is involved, so a fresh main failure against a new Hyprland
+      # points upstream.
+      - name: Note possible upstream breakage on main
+        if: failure() && steps.build.outcome == 'failure' && github.event_name != 'pull_request'
+        run: |
+          HYPR_VER=$(pkg-config --modversion hyprland)
+          {
+            echo "## Build of main failed (Hyprland ${HYPR_VER})"
+            echo ""
+            echo "If main was green before, an upstream Hyprland update likely broke the build and the plugin"
+            echo "needs to be updated/redesigned for the new Hyprland version (it hooks Hyprland's internal,"
+            echo "version-unstable API — see README)."
+          } >> "$GITHUB_STEP_SUMMARY"
