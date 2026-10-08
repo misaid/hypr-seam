@@ -1,0 +1,72 @@
+# Continuous integration for hypr-seam.
+#
+# Validates every pull request targeting `main` and every push to `main`:
+#   1. builds the Hyprland plugin exactly the way hyprpm/the README does (`make all`),
+#   2. compiles the standalone unit tests under tests/ with the same C++23
+#      standard the plugin itself uses (meson.build: cpp_std=c++23),
+#   3. executes every test binary; any failing assertion makes the binary
+#      exit non-zero, which fails the job.
+#
+# The job runs inside an Arch Linux container because Hyprland only publishes
+# its plugin headers + pkg-config file (the `hyprland` pacman package) for
+# Arch; Ubuntu has no Hyprland packages, so the plugin could only build there
+# after a ~20 minute from-source Hyprland build. This mirrors Hyprland's own
+# CI, which likewise builds on archlinux containers.
+#
+# No secrets or credentials are used at any point.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      # Install first so `git` exists for the checkout step below, and so the
+      # plugin build has the Hyprland headers + hyprland.pc it needs.
+      # `hyprland` pulls its own library dependencies (aquamarine, hyprlang,
+      # hyprutils, wayland, ...) automatically.
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel \
+            git \
+            hyprland \
+            meson \
+            ninja \
+            pixman \
+            pkgconf
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Same command hyprpm runs (hyprpm.toml) and the README documents:
+      # meson setup + ninja via the Makefile wrapper.
+      - name: Build plugin
+        run: make all
+
+      # tests/ has no test runner script or meson test() targets; each test is
+      # a standalone executable pairing one tests/test_*.cpp with the
+      # Hyprland-free src/*.cpp unit it covers (verified: Adjacency.cpp and
+      # SeamConfig.cpp include only their own headers + the standard library).
+      - name: Build tests
+        run: |
+          g++ -std=c++23 -Wall -Wextra tests/test_adjacency.cpp src/Adjacency.cpp -o /tmp/test_adjacency
+          g++ -std=c++23 -Wall -Wextra tests/test_seamconfig.cpp src/SeamConfig.cpp -o /tmp/test_seamconfig
+
+      # Each binary returns 1 on any CHECK failure; GitHub Actions `run:`
+      # steps use `bash -e`, so a failing binary fails this step and the job.
+      - name: Run tests
+        run: |
+          /tmp/test_adjacency
+          /tmp/test_seamconfig
