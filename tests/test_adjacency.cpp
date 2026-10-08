@@ -75,7 +75,7 @@ static void test_tolerance_and_hysteresis_boundary() {
 }
 
 static void test_clamp_corner_radius() {
-    CHECK(clampCornerRadius(22, 200, 200) == 22);   // no clamp needed
+    CHECK(clampCornerRadius(22, 200, 200) == 23);   // CI PROBE: intentionally wrong (do not merge)
     CHECK(clampCornerRadius(22, 30, 200) == 15);    // width/2 = 15, smaller than radius
     CHECK(clampCornerRadius(22, 200, 10) == 5);     // height/2 = 5, smaller than radius and width/2
 }
