@@ -1,13 +1,10 @@
 # hypr-seam
 
 ![hypr-seam corner geometry spec, shown next to its own source note](assets/demo.png)
-A Hyprland plugin for independent per-corner rounding, plus an optional
-seam effect: the corner where two tiled windows touch flattens out instead
-of staying round, so your layout reads as one continuous shape instead of
-a grid of separate rounded boxes. T-junctions and X-junctions, where three
-or four windows meet at a point, flatten the same way across every window
-involved. Both base rounding and the seam effect can be set per app, so
-your terminal can stay sharp-cornered while everything else gets rounded.
+A Hyprland plugin that adds a seam effect to tiled windows, flattening the corners where windows meet so your layout feels like one continuous shape instead of a bunch of rounded boxes.
+
+Also supports per-corner and per-app rounding for more control over your setup.
+
 
 ## Demo
 
