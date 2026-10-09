@@ -324,8 +324,10 @@ static void checkNativeRoundingIsZero() {
 // reloaded, after the new values are in.
 //
 // Also registers the window-tracking and adjacency-recompute triggers. Hyprland has no
-// window move/resize event, so geometry changes are caught on `tick`, behind a cheap
-// dirty check (SeamState::onTick()) that keeps idle ticks nearly free.
+// window move/resize event and none for a `hyprctl keyword` change, so both are caught
+// on `tick`, behind a cheap dirty check (SeamState::onTick()) that keeps idle ticks
+// nearly free. `tick` only fires while something animates, so a keyword change on an
+// idle desktop waits for the next animation.
 static void registerEventListeners() {
     g_listeners.emplace_back(Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); }));
     // Recompute on a full config reload, such as `hyprctl reload` after editing rules,
@@ -337,12 +339,16 @@ static void registerEventListeners() {
     }));
     // EventBus.hpp doesn't document when config.props_refreshed fires. This listener is
     // a cheap extra in case some config change fires it without a full reload. Tested:
-    // `hyprctl keyword plugin:seam:... <value>` does not fire it, so a keyword change
-    // still waits for a window, workspace or monitor event, or a `hyprctl reload`.
+    // `hyprctl keyword plugin:seam:... <value>` does not fire it; SeamState::onTick()
+    // picks that change up instead.
     g_listeners.emplace_back(Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); }));
 
     g_listeners.emplace_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); }));
+    // A new title or class can make a different seamrule match. These apply it right
+    // away instead of at the window's next layout change.
+    g_listeners.emplace_back(Event::bus()->m_events.window.title.listen([](PHLWINDOW w) { SeamState::recomputeWindow(w); }));
+    g_listeners.emplace_back(Event::bus()->m_events.window.class_.listen([](PHLWINDOW w) { SeamState::recomputeWindow(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.fullscreen.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.moveToWorkspace.listen([](PHLWINDOW, PHLWORKSPACE) { SeamState::recomputeAll(); }));

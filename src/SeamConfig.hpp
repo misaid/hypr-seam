@@ -9,6 +9,8 @@ struct SCornerRadii {
     double topRight    = 0.0;
     double bottomLeft  = 0.0;
     double bottomRight = 0.0;
+
+    bool operator==(const SCornerRadii&) const = default;
 };
 
 struct SGlobalSeamDefaults {
@@ -17,6 +19,10 @@ struct SGlobalSeamDefaults {
     bool         seamEnabled   = false;
     double       seamRadius    = 0.0;
     double       tolerance     = 0.0;
+
+    // Defaulted, so a field added later is compared too. SeamState's tick check relies on
+    // this to notice any config change that affects a recompute.
+    bool operator==(const SGlobalSeamDefaults&) const = default;
 };
 
 struct SSeamRule {

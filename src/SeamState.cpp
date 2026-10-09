@@ -1,5 +1,6 @@
 #include "SeamState.hpp"
 #include "Adjacency.hpp"
+#include "RecomputeGate.hpp"
 #include "SeamConfig.hpp"
 #include "SeamRuleStore.hpp"
 #include "globals.hpp"
@@ -29,14 +30,14 @@ struct SWindowEntry {
     bool              wasTouching[4] = {false, false, false, false}; // TL, TR, BL, BR
 };
 
-// g_entries, g_lastFingerprint and g_pendingCloseRecompute are unsynchronized. That's
+// g_entries, g_recomputeGate and g_pendingCloseRecompute are unsynchronized. That's
 // safe because Hyprland runs every event-bus callback, including `tick`, on its main
 // thread.
 std::unordered_map<PHLWINDOW, SWindowEntry> g_entries;
 
-// Fingerprint of every mapped window's position, size and floating state. onTick()
-// uses it to skip recomputeAll() when nothing that affects adjacency has changed.
-std::size_t g_lastFingerprint = 0;
+// Remembers the geometry fingerprint and resolved defaults from the last tick, so
+// onTick() can skip recomputeAll() when neither has changed.
+CRecomputeGate g_recomputeGate;
 
 // Sequence id of the doLater recompute scheduled by onWindowClosed(), or 0 if none.
 // clear() cancels it on plugin unload, since a callback still queued after the .so
@@ -73,9 +74,9 @@ SP<Hyprutils::Animation::SAnimationPropertyConfig>& seamAnimationConfig() {
 }
 
 // Copies the live plugin:seam:* values into the shared animation config. Every
-// recomputeAll() calls it, so an edited and reloaded animation_curve or
-// animation_speed takes effect. A bare `hyprctl keyword` doesn't trigger a
-// recompute; see registerEventListeners() in main.cpp.
+// recompute calls it before retargeting, so a new animation_curve or animation_speed
+// applies from the next corner animation on, whether it came from a reload, a
+// keyword or hyprctl eval.
 void refreshAnimationConfig() {
     static auto PCURVE = CConfigValue<Config::STRING>("plugin:seam:animation_curve");
     static auto PSPEED = CConfigValue<Config::FLOAT>("plugin:seam:animation_speed");
@@ -254,7 +255,7 @@ void SeamState::clear() {
         g_pEventLoopManager->removeDoLater(g_pendingCloseRecompute);
     g_pendingCloseRecompute = 0;
     g_entries.clear();
-    g_lastFingerprint = 0;
+    g_recomputeGate.reset();
 }
 
 std::optional<SeamState::SLiveCorners> SeamState::liveCornersFor(const PHLWINDOW& window) {
@@ -265,7 +266,10 @@ std::optional<SeamState::SLiveCorners> SeamState::liveCornersFor(const PHLWINDOW
     return SLiveCorners{it->second.topLeft->value(), it->second.topRight->value(), it->second.bottomLeft->value(), it->second.bottomRight->value()};
 }
 
-void SeamState::recomputeAll() {
+// Shared body of recomputeAll() and recomputeWindow(). With `only` set, just that
+// window is retargeted. Every visible window is still collected, because the
+// window's adjacency depends on its neighbors.
+static void recompute(const PHLWINDOW& only) {
     refreshAnimationConfig(); // picks up any live curve/speed config change
     const auto defaults = currentGlobalDefaults();
 
@@ -290,6 +294,8 @@ void SeamState::recomputeAll() {
 
     for (size_t i = 0; i < windows.size(); ++i) {
         auto& w = windows[i];
+        if (only && w != only)
+            continue;
 
         auto it = g_entries.find(w);
         if (it == g_entries.end())
@@ -305,6 +311,15 @@ void SeamState::recomputeAll() {
         else
             retargetEnabled(entry, resolved, subjectBox, pools[workspaces[i]], defaults);
     }
+}
+
+void SeamState::recomputeAll() {
+    recompute(nullptr);
+}
+
+void SeamState::recomputeWindow(const PHLWINDOW& window) {
+    if (window)
+        recompute(window);
 }
 
 void SeamState::onTick() {
@@ -327,11 +342,12 @@ void SeamState::onTick() {
     // closed windows alive and outlive a plugin unload.
     windows.clear();
 
-    const std::size_t fingerprint = fingerprintVisibleWindows(boxes, workspaces);
-    if (fingerprint == g_lastFingerprint)
+    // The defaults are compared too, because a `hyprctl keyword plugin:seam:...` change
+    // fires no event. They're resolved from live config values, so a general:gaps_in
+    // change that moves the derived tolerance is caught the same way.
+    if (!g_recomputeGate.changed(fingerprintVisibleWindows(boxes, workspaces), currentGlobalDefaults()))
         return;
 
-    g_lastFingerprint = fingerprint;
     recomputeAll();
 }
 

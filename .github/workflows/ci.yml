@@ -71,12 +71,14 @@ jobs:
 
       # tests/ has no test runner script or meson test() targets; each test is
       # a standalone executable pairing one tests/test_*.cpp with the
-      # Hyprland-free src/*.cpp unit it covers (verified: Adjacency.cpp and
-      # SeamConfig.cpp include only their own headers + the standard library).
+      # Hyprland-free src/*.cpp unit it covers (verified: Adjacency.cpp,
+      # SeamConfig.cpp and RecomputeGate.cpp include only their own headers, each
+      # other's headers, and the standard library).
       - name: Build tests
         run: |
           g++ -std=c++23 -Wall -Wextra tests/test_adjacency.cpp src/Adjacency.cpp -o /tmp/test_adjacency
           g++ -std=c++23 -Wall -Wextra tests/test_seamconfig.cpp src/SeamConfig.cpp -o /tmp/test_seamconfig
+          g++ -std=c++23 -Wall -Wextra tests/test_recomputegate.cpp src/RecomputeGate.cpp -o /tmp/test_recomputegate
 
       # Each binary returns 1 on any CHECK failure; GitHub Actions `run:`
       # steps use `bash -e`, so a failing binary fails this step and the job.
@@ -84,6 +86,7 @@ jobs:
         run: |
           /tmp/test_adjacency
           /tmp/test_seamconfig
+          /tmp/test_recomputegate
 
       # If the plugin itself failed to compile on a PR, say plainly whether
       # the PR or an upstream Hyprland change is the likely cause: rebuild the

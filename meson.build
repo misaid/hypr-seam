@@ -8,6 +8,7 @@ pixman = dependency('pixman-1')
 sources = [
   'src/main.cpp',
   'src/SeamConfig.cpp',
+  'src/RecomputeGate.cpp',
   'src/SeamRuleStore.cpp',
   'src/Adjacency.cpp',
   'src/SeamState.cpp',

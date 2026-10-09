@@ -1,6 +1,8 @@
 #include "SeamConfig.hpp"
+#include <optional>
 #include <regex>
 #include <sstream>
+#include <unordered_map>
 
 namespace {
 struct SPatternMatchResult {
@@ -8,16 +10,35 @@ struct SPatternMatchResult {
     bool matched; // true if the pattern is non-empty and valid
 };
 
+// Compiles each pattern once. Every title change resolves the window's rules again, and
+// some apps retitle constantly (a terminal on every command, a browser on every tab
+// switch), so compiling on each resolve would be the slow part. std::nullopt marks a
+// malformed pattern. Entries are keyed by the pattern text, so they never go stale, and
+// the map only grows by the number of distinct patterns the config has used. Only
+// Hyprland's main thread resolves rules, so the cache needs no lock.
+const std::optional<std::regex>& compiledPattern(const std::string& pattern) {
+    static std::unordered_map<std::string, std::optional<std::regex>> cache;
+
+    auto it = cache.find(pattern);
+    if (it == cache.end()) {
+        std::optional<std::regex> compiled;
+        try {
+            compiled.emplace(pattern);
+        } catch (const std::regex_error&) {
+            // malformed: stays std::nullopt, and patternMatches() skips the rule
+        }
+        it = cache.emplace(pattern, std::move(compiled)).first;
+    }
+    return it->second;
+}
+
 SPatternMatchResult patternMatches(const std::string& pattern, const std::string& subject) {
     if (pattern.empty())
         return {true, false}; // this field is unconstrained by the rule
-    std::regex re;
-    try {
-        re = std::regex(pattern);
-    } catch (const std::regex_error&) {
+    const auto& re = compiledPattern(pattern);
+    if (!re)
         return {false, false}; // malformed pattern: skip the whole rule instead of throwing
-    }
-    return {std::regex_search(subject, re), true};
+    return {std::regex_search(subject, *re), true};
 }
 } // namespace
 

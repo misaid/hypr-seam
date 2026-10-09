@@ -21,6 +21,11 @@ namespace SeamState {
     // so a recompute that fires mid-animation sees the final layout.
     void recomputeAll();
 
+    // Recomputes just `window`, for a change that can't affect any other window: a new
+    // title or class can make a different seamrule match it. Does nothing if the window
+    // is null, not tracked, or not visible.
+    void recomputeWindow(const PHLWINDOW& window);
+
     // Per-window live corner radii, read every frame by the render hooks (SeamHook.cpp, SeamDecorHook.cpp).
     // Returns std::nullopt if the window isn't tracked (mapped windows always are).
     std::optional<SLiveCorners> liveCornersFor(const PHLWINDOW& window);
@@ -34,14 +39,17 @@ namespace SeamState {
     void clear();
 
     // Hyprland's event bus has no window move/resize event (EventBus.hpp only has
-    // open, close, floating, fullscreen and moveToWorkspace for windows). main.cpp
-    // calls this from its `tick` listener. It fingerprints every mapped window's GOAL
-    // position, size and floating state, and runs recomputeAll() only when the
-    // fingerprint changed since the last call.
+    // open, close, floating, fullscreen and moveToWorkspace for windows), and nothing
+    // fires for a `hyprctl keyword` change. main.cpp calls this from its `tick`
+    // listener. It fingerprints every mapped window's GOAL position, size and floating
+    // state, resolves the global defaults, and runs recomputeAll() only when either
+    // changed since the last call.
     //
-    // `tick` fires in bursts while the compositor renders and stops when it goes
-    // idle, so this is a best-effort catch-all. Correctness comes from
-    // recomputeAll() using GOAL geometry, which doesn't depend on when this fires.
+    // `tick` fires only while an animation runs (CHyprAnimationManager::frameTick())
+    // and stops when the compositor goes idle, so this is a best-effort catch-all. A
+    // keyword change on an idle desktop applies with the next animation. Geometry stays
+    // correct because recomputeAll() uses GOAL geometry, which doesn't depend on when
+    // this fires.
     void onTick();
 
     // Backs the `seam:debugstate` dispatcher in main.cpp. Returns every tracked

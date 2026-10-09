@@ -2,6 +2,7 @@
 #include "../src/SeamConfig.hpp"
 #include <cassert>
 #include <cstdio>
+#include <vector>
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -131,6 +132,40 @@ static void test_default_constructed_rule_has_safe_defaults() {
     CHECK(rule.titlePattern.empty());
 }
 
+// Regression: a window's rule follows its current title. The plugin used to resolve
+// only on layout changes, so a window kept the rule it matched when it opened. These
+// resolves are what SeamState::recomputeWindow() runs on every title change.
+static void test_rule_follows_title_changes() {
+    SSeamRule rule{.isSeamDirective = false, .radii = {0, 0, 0, 0}, .titlePattern = "nvim"};
+    const std::vector<SSeamRule> rules{rule};
+
+    CHECK(resolveWindowConfig("kitty", "~", false, defaultDefaults(), rules).radii.topLeft == 22);
+    CHECK(resolveWindowConfig("kitty", "nvim src/main.cpp", false, defaultDefaults(), rules).radii.topLeft == 0);
+    CHECK(resolveWindowConfig("kitty", "~", false, defaultDefaults(), rules).radii.topLeft == 22);
+}
+
+// Patterns are compiled once and cached. A cached pattern must keep matching and
+// rejecting exactly as a fresh one would.
+static void test_cached_pattern_keeps_matching() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .classPattern = "^(mpv)$"};
+    for (int i = 0; i < 3; ++i) {
+        CHECK(resolveWindowConfig("mpv", "", false, defaultDefaults(), {rule}).seamEnabled == true);
+        CHECK(resolveWindowConfig("mpvx", "", false, defaultDefaults(), {rule}).seamEnabled == false);
+    }
+}
+
+// A malformed pattern is cached as malformed, so the rule is skipped on every resolve,
+// not only the first, and later valid rules still apply.
+static void test_malformed_pattern_skipped_every_time() {
+    SSeamRule broken{.isSeamDirective = false, .radii = {1, 1, 1, 1}, .classPattern = "(kitty"};
+    SSeamRule valid{.isSeamDirective = true, .seamOn = true, .classPattern = "^(kitty)$"};
+    for (int i = 0; i < 3; ++i) {
+        const auto result = resolveWindowConfig("kitty", "", false, defaultDefaults(), {broken, valid});
+        CHECK(result.radii.topLeft == 22);
+        CHECK(result.seamEnabled == true);
+    }
+}
+
 int main() {
     test_default_constructed_rule_has_safe_defaults();
     test_title_rule_matches_by_title_only();
@@ -146,6 +181,9 @@ int main() {
     test_parse_rounding_rule_line();
     test_parse_seam_rule_line();
     test_parse_malformed_line_fails();
+    test_rule_follows_title_changes();
+    test_cached_pattern_keeps_matching();
+    test_malformed_pattern_skipped_every_time();
 
     if (failures == 0) {
         std::printf("All seam-config tests passed.\n");

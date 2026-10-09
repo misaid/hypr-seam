@@ -192,3 +192,9 @@ mistakes.
   per-corner re-render technique as window content, applied to Hyprland's
   own border and shadow passes. Until enabled, a window's border and
   shadow stay native (square, if `decoration:rounding = 0`).
+- With a hyprlang `.conf` config, `hyprctl keyword plugin:seam:...` changes
+  don't apply right away. Hyprland fires no event for them, so hypr-seam
+  picks them up on the next animation (a focus change or a window moving).
+  `hyprctl reload` applies them immediately. Lua configs aren't affected:
+  `hl.config` changes through `hyprctl eval` apply at once. Hyprland
+  removes `.conf` support in 0.57.
