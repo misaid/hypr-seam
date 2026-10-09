@@ -12,9 +12,8 @@ struct SCornerFlags {
     bool topLeft = false, topRight = false, bottomLeft = false, bottomRight = false;
 };
 
-// Stateless point-in-time check. Hysteresis (requiring a gap to exceed, not just
-// reach, `tolerance` before un-flagging) is applied by the caller across repeated
-// calls — see SeamState.cpp.
+// Checks one moment and keeps no state. SeamState.cpp adds hysteresis across calls:
+// a corner that is already flagged stays flagged until the gap exceeds 1.5x `tolerance`.
 SCornerFlags computeTouchingCorners(const SSeamBox& subject, const std::vector<SSeamBox>& all, double tolerance);
 
 constexpr double clampCornerRadius(double radius, double width, double height) {

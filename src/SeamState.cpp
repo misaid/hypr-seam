@@ -18,63 +18,51 @@
 #include <functional>
 #include <cstddef>
 
-// NOTE on currentGlobalDefaults(): globals.hpp (Task 4) already declares this
-// non-static, so we include it directly rather than re-declaring it here.
-
 namespace {
 
 // PHLWINDOW is SP<Desktop::View::CWindow> (Hyprutils::Memory::CSharedPointer<T>).
-// Confirmed against the installed <hyprutils/memory/SharedPtr.hpp>: it has both
-// `operator==` (compares the shared control-block pointer) and a
-// `std::hash<CSharedPointer<T>>` specialization (hashes that same pointer), so it's
-// directly usable as an unordered_map key out of the box — no raw-pointer key or
-// custom comparator needed.
+// <hyprutils/memory/SharedPtr.hpp> gives it an `operator==` and a
+// `std::hash<CSharedPointer<T>>` specialization, both based on the control-block
+// pointer, so it works directly as an unordered_map key.
 struct SWindowEntry {
     PHLANIMVAR<float> topLeft, topRight, bottomLeft, bottomRight;
     bool              wasTouching[4] = {false, false, false, false}; // TL, TR, BL, BR
 };
 
-// g_entries/g_lastFingerprint/g_pendingCloseRecompute below are plain unsynchronized
-// module state: safe only because Hyprland always dispatches plugin event-bus
-// callbacks (and `tick`) from its single main thread, never concurrently.
+// g_entries, g_lastFingerprint and g_pendingCloseRecompute are unsynchronized. That's
+// safe because Hyprland runs every event-bus callback, including `tick`, on its main
+// thread.
 std::unordered_map<PHLWINDOW, SWindowEntry> g_entries;
 
-// Fingerprint of every mapped window's position/size/floating state, used by
-// onTick() to skip recomputeAll() when nothing that could affect adjacency has
-// actually changed since the last tick.
+// Fingerprint of every mapped window's position, size and floating state. onTick()
+// uses it to skip recomputeAll() when nothing that affects adjacency has changed.
 std::size_t g_lastFingerprint = 0;
 
-// Sequence id of a pending deferred (doLater) recompute scheduled by
-// onWindowClosed(), or 0 if none. Tracked so clear() (called on plugin unload)
-// can cancel it — an idle callback still queued after the .so is unmapped
-// would jump into freed code.
+// Sequence id of the doLater recompute scheduled by onWindowClosed(), or 0 if none.
+// clear() cancels it on plugin unload, since a callback still queued after the .so
+// is unmapped would jump into freed code.
 uint64_t g_pendingCloseRecompute = 0;
 
-// Builds our own animation property config directly from plugin:seam:* values,
-// rather than looking one up by name in Hyprland's global animation tree
-// (Config::animationTree()->getAnimationPropertyConfig(name)). That tree only
-// contains nodes Hyprland itself registers for its own animations (e.g. "windows",
-// "border", "fade", ...) — "default" (our animation_curve default) is a *bezier
-// curve* name, not a tree node name, so looking it up as a node would miss and
-// hand back a dangling/empty config. Building our own SAnimationPropertyConfig
-// with `overridden = true` sidesteps the tree/inheritance machinery entirely and
-// just uses our own bezier name + speed directly.
+// Builds the plugin's own animation property config from plugin:seam:* values.
+// Looking one up in Hyprland's animation tree
+// (Config::animationTree()->getAnimationPropertyConfig(name)) won't work: the tree
+// only has nodes Hyprland registers for its own animations ("windows", "border",
+// "fade", ...), and "default", the animation_curve default, is a bezier curve name.
+// Looking it up as a node returns an empty config. With `overridden = true`, this
+// config skips the tree's inheritance and uses our bezier name and speed.
 //
-// This MUST have static lifetime: CBaseAnimatedVariable only keeps a *weak*
-// pointer to whatever config it's given (see m_pConfig in the installed
-// <hyprutils/animation/AnimatedVariable.hpp>), and AnimationConfig.hpp's own
-// doc comment says config properties "need to have a static lifetime to allow
-// for config reload." A per-window local (as this used to be) is destroyed the
-// instant onWindowOpened() returns, so every animated var's config weak
-// pointer would dangle immediately — the animation system then can't resolve
-// enabled()/getBezierName()/getCurveStep() and silently falls back to warping
-// every retarget, regardless of plugin:seam:animate.
+// The config must have static lifetime. CBaseAnimatedVariable keeps only a weak
+// pointer to its config (m_pConfig in <hyprutils/animation/AnimatedVariable.hpp>),
+// and AnimationConfig.hpp says config properties "need to have a static lifetime
+// to allow for config reload." A local in onWindowOpened() would leave every
+// animated var's weak pointer dangling. The animation system then can't resolve
+// enabled()/getBezierName()/getCurveStep() and warps every retarget, whatever
+// plugin:seam:animate says.
 //
-// Also sets `pValues` to reference itself: per CAnimationConfigTree::
-// createNode's doc comment, "If parent is empty, a root node will be created
-// that references its own values" — value accessors read through pValues, so
-// a standalone config built outside that tree (as ours is) needs that
-// self-reference wired by hand to expose its bezier/speed at all.
+// `pValues` points back at the config itself. CAnimationConfigTree::createNode's
+// doc comment says "If parent is empty, a root node will be created that
+// references its own values", and the value accessors read through pValues, so a
+// config built outside the tree has to set that up by hand.
 SP<Hyprutils::Animation::SAnimationPropertyConfig>& seamAnimationConfig() {
     static SP<Hyprutils::Animation::SAnimationPropertyConfig> config;
     if (!config) {
@@ -84,12 +72,10 @@ SP<Hyprutils::Animation::SAnimationPropertyConfig>& seamAnimationConfig() {
     return config;
 }
 
-// Refreshes the shared animation config's fields from the live plugin:seam:*
-// config values. Called on every recomputeAll() (and so, transitively, on
-// every config reload / live keyword change that triggers one) rather than
-// only once, so a live `hyprctl keyword plugin:seam:animation_curve ...` (or
-// an edited + reloaded config file) takes effect without needing its own
-// special-cased refresh path.
+// Copies the live plugin:seam:* values into the shared animation config. Every
+// recomputeAll() calls it, so an edited and reloaded animation_curve or
+// animation_speed takes effect. A bare `hyprctl keyword` doesn't trigger a
+// recompute; see registerEventListeners() in main.cpp.
 void refreshAnimationConfig() {
     static auto PCURVE = CConfigValue<Config::STRING>("plugin:seam:animation_curve");
     static auto PSPEED = CConfigValue<Config::FLOAT>("plugin:seam:animation_speed");
@@ -97,11 +83,8 @@ void refreshAnimationConfig() {
     auto& cfg            = seamAnimationConfig();
     cfg->overridden      = true;
     cfg->internalBezier  = *PCURVE;
-    // plugin:seam:animation_speed is documented (Task 4) as a duration in ms,
-    // but Hyprland's native animation speed unit is hundreds of milliseconds
-    // (i.e. 1.0 == 100ms) — confirmed during review — so convert here rather
-    // than handing the raw ms value to the animation engine (which would turn
-    // a configured 300ms into a ~30s transition).
+    // plugin:seam:animation_speed is in ms, but Hyprland's animation speed unit is
+    // 100ms (1.0 == 100ms). Passing the raw value would turn 300ms into about 30s.
     cfg->internalSpeed   = *PSPEED / 100.0F;
     cfg->internalEnabled = 1;
 }
@@ -115,35 +98,27 @@ void retarget(PHLANIMVAR<float>& anim, double target) {
     *anim = sc<float>(target);
 }
 
-// Collects every currently-visible mapped window (including ones on special
-// workspaces, as long as that special workspace is actually toggled open) as
-// adjacency boxes, in lockstep with parallel lists of the windows themselves and
-// of each window's workspace, so `boxes[i]`, `windows[i]` and `workspaces[i]`
-// always refer to the same window.
+// Collects every visible mapped window as an adjacency box, including windows on a
+// special workspace that is toggled open. The three output lists stay in step:
+// `boxes[i]`, `windows[i]` and `workspaces[i]` describe the same window.
 //
-// `w->isHidden()` (checked below) is a *group* visibility flag (m_hidden —
-// e.g. a window hidden inside a collapsed window group), not workspace
-// visibility: a window on an inactive workspace keeps its normal monitor-space
-// coordinates and still passes that check. Without also filtering on
-// `w->m_workspace->isVisible()`, a window on workspace 2 could get flattened
-// against a window on workspace 1 just because their stale monitor-space
-// coordinates happen to overlap — confirmed during review as a real bug in an
-// earlier version of this function, caught only because a single-workspace
-// manual test can't exercise it.
+// `w->isHidden()` reads m_hidden, which is group visibility (a window hidden in a
+// collapsed group). A window on an inactive workspace keeps its monitor-space
+// coordinates and passes that check, so `w->m_workspace->isVisible()` is checked
+// too. Without it, a window on workspace 2 could be flattened against one on
+// workspace 1 because their coordinates overlap.
 //
-// Fullscreen/maximized: when a workspace has a covering fullscreen or maximized
-// window, the tiled windows it covers are still mapped and "visible" by every
-// flag above, but they're hidden behind it — and their edges sit exactly where the
-// covering window's screen-edge corners are, so they'd falsely flag those corners
-// as touching. So on such a workspace only the covering window itself (plus any
-// floating windows, which never act as neighbors and never flatten — kept only so
-// their base radii still get retargeted on config changes) participates. The
-// covered tiled windows are left out entirely: they aren't on screen, and the
-// window.fullscreen event re-runs recomputeAll() as soon as they're uncovered.
+// When a workspace has a fullscreen or maximized window, the tiled windows behind
+// it still pass every check above. Their edges line up with the covering window's
+// screen-edge corners and would flag those corners as touching. On such a
+// workspace only the covering window and any floating windows are collected.
+// Floating windows never act as neighbors or flatten; they're kept so their base
+// radii still update on config changes. The covered windows aren't on screen, and
+// the window.fullscreen event runs recomputeAll() again once they're uncovered.
 //
-// `geomType` lets callers choose GEOMETRIC_CURRENT (the live, animated
-// position) or GEOMETRIC_GOAL (the animation target — what both recomputeAll()
-// and onTick()'s cheap dirty-check use; see recomputeAll()).
+// `geomType` picks GEOMETRIC_CURRENT (the live, animated position) or
+// GEOMETRIC_GOAL (the animation target). recomputeAll() and onTick() both use
+// GOAL; see recomputeAll().
 void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>& windows, std::vector<const CWorkspace*>& workspaces,
                            Desktop::View::IGeometric::eGeometricValueType geomType = Desktop::View::IGeometric::GEOMETRIC_CURRENT) {
     using Desktop::View::IGeometric;
@@ -171,8 +146,8 @@ void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>&
     }
 }
 
-// Cheap fingerprint of everything that can affect adjacency output, so onTick()
-// can skip the full O(n^2) recompute on ticks where nothing moved.
+// Cheap hash of everything that affects adjacency, so onTick() can skip the
+// O(n^2) recompute on ticks where nothing moved.
 std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const std::vector<const CWorkspace*>& workspaces) {
     std::size_t hash = boxes.size();
     auto        mix  = [&hash](std::size_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL /* splitmix64-style mix constant */ + (hash << 6) + (hash >> 2); };
@@ -188,9 +163,9 @@ std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const 
     return hash;
 }
 
-// Seam is off for this window (globally, by rule, or because it's floating):
-// use plain per-corner base radii and drop any stale hysteresis state so a
-// later re-enable (e.g. a config reload or rule change) starts clean.
+// Seam is off for this window (globally, by rule, or because it floats). Uses the
+// base radii and clears hysteresis state, so turning seam back on later (by config
+// reload or rule change) starts clean.
 void retargetDisabled(SWindowEntry& entry, const SResolvedWindowConfig& resolved, const SSeamBox& subjectBox) {
     entry.wasTouching[0] = entry.wasTouching[1] = entry.wasTouching[2] = entry.wasTouching[3] = false;
 
@@ -204,12 +179,9 @@ void retargetEnabled(SWindowEntry& entry, const SResolvedWindowConfig& resolved,
                       const SGlobalSeamDefaults& defaults) {
     const SCornerFlags touching = computeTouchingCorners(subjectBox, pool, defaults.tolerance);
 
-    // Hysteresis: once a corner is flagged as touching, don't drop the flag the
-    // instant the normal-tolerance check fails — only drop it once a *widened*
-    // tolerance check also fails, i.e. once the gap has clearly grown past the
-    // boundary rather than merely crossed it. (The reverse direction — going
-    // from unflagged to flagged — always uses the normal tolerance immediately;
-    // hysteresis only guards against flicker on the way out.)
+    // Hysteresis: a corner that is already flagged stays flagged until the check
+    // with 1.5x tolerance also fails, so it doesn't flicker when the gap sits right
+    // at the boundary. Becoming flagged uses the normal tolerance.
     const SCornerFlags widened = computeTouchingCorners(subjectBox, pool, defaults.tolerance * 1.5);
 
     auto resolveCorner = [&](bool rawTouching, bool widenedTouching, bool& wasTouching, double baseRadius) {
@@ -263,13 +235,12 @@ void SeamState::onWindowOpened(const PHLWINDOW& window) {
 void SeamState::onWindowClosed(const PHLWINDOW& window) {
     g_entries.erase(window);
 
-    // The closed window's former neighbors may have just lost a touching corner
-    // (or will be reflowed into its space); update them promptly instead of
-    // waiting for the tick fallback. Deferred to the next event-loop idle rather
-    // than run inline: window.close is emitted at the very start of
-    // CWindow::unmapWindow(), while the closing window is still m_isMapped and
-    // before the layout has removed it / retargeted its neighbors' goal
-    // geometry, so an inline recompute would still see the old layout.
+    // The closed window's neighbors may have lost a touching corner, or will be
+    // reflowed into its space, so update them now instead of waiting for a tick.
+    // The recompute runs at the next event-loop idle. window.close fires at the
+    // start of CWindow::unmapWindow(), while the window is still m_isMapped and
+    // before the layout has removed it and moved its neighbors' goal geometry, so
+    // an inline recompute would see the old layout.
     if (g_pendingCloseRecompute == 0 && g_pEventLoopManager) {
         g_pendingCloseRecompute = g_pEventLoopManager->doLater([] {
             g_pendingCloseRecompute = 0;
@@ -298,30 +269,21 @@ void SeamState::recomputeAll() {
     refreshAnimationConfig(); // picks up any live curve/speed config change
     const auto defaults = currentGlobalDefaults();
 
-    // Use GOAL geometry here, not the live/animated current position, and not
-    // only in onTick()'s fingerprint. Found during fix-round-1 verification:
-    // a discrete event (e.g. window.fullscreen) can fire while the window's
-    // position/size animation is still mid-flight toward its new layout slot,
-    // so a recompute driven by CURRENT geometry at that instant can capture a
-    // transient, not-yet-settled box — and since Hyprland's `tick` event is
-    // NOT a continuous per-frame heartbeat (confirmed empirically: it stops
-    // firing once the compositor goes render-idle, which can happen very
-    // shortly after the animation completes), there's no guarantee a later
-    // correcting recompute ever runs to fix a wrong hysteresis flag baked in
-    // from that transient moment. Using the GOAL geometry instead means every
-    // recompute — whenever it happens to fire — always judges adjacency
-    // against the final, authoritative layout, never an in-between frame, so
-    // there's nothing for a later recompute to need to "correct".
+    // Use GOAL geometry, not the live animated position. An event such as
+    // window.fullscreen can fire while a window is still animating toward its new
+    // slot, and CURRENT geometry at that moment is an in-between box. `tick` stops
+    // firing soon after the compositor goes idle, so a later recompute may never
+    // run to fix a hysteresis flag set from that box. GOAL geometry is the final
+    // layout no matter when the recompute fires.
     std::vector<SSeamBox>           boxes;
     std::vector<PHLWINDOW>          windows;
     std::vector<const CWorkspace*> workspaces;
     collectVisibleWindows(boxes, windows, workspaces, Desktop::View::IGeometric::GEOMETRIC_GOAL);
 
-    // Adjacency is only ever judged between windows on the SAME workspace (and so,
-    // implicitly, the same monitor). Pooling everything together let a window's
-    // screen-edge corner land within tolerance of a window on the neighboring
-    // monitor (only gaps_out apart, or less with a raised tolerance), or of a window
-    // on a special workspace overlaid on top, and get falsely flattened.
+    // Adjacency is judged only between windows on the same workspace, and so the
+    // same monitor. Otherwise a screen-edge corner can land within tolerance of a
+    // window on the next monitor (only gaps_out away) or on a special workspace
+    // shown on top, and get flattened.
     std::unordered_map<const CWorkspace*, std::vector<SSeamBox>> pools;
     for (size_t i = 0; i < boxes.size(); ++i)
         pools[workspaces[i]].push_back(boxes[i]);
@@ -346,14 +308,8 @@ void SeamState::recomputeAll() {
 }
 
 void SeamState::onTick() {
-    // Reused across calls rather than allocated fresh every tick — this runs
-    // on every compositor tick, so a fresh heap allocation per call here would
-    // be a steady, avoidable cost even when nothing changed. (Confirmed during
-    // fix-round-1 verification — via a temporary invocation counter, since
-    // removed — that `tick` is NOT a continuous per-frame heartbeat: it fires
-    // in bursts while the compositor is actively rendering/animating and goes
-    // fully silent once idle. recomputeAll() no longer depends on a trailing
-    // tick to "catch" a settled layout — see the GOAL-geometry comment there.)
+    // Static so the vectors are reused across ticks. This runs on every tick, and
+    // allocating each time would cost something even when nothing changed.
     static std::vector<SSeamBox>           boxes;
     static std::vector<PHLWINDOW>          windows;
     static std::vector<const CWorkspace*> workspaces;
@@ -361,19 +317,14 @@ void SeamState::onTick() {
     windows.clear();
     workspaces.clear();
 
-    // Fingerprint the *goal* geometry, not the live/animated current geometry.
-    // Using GEOMETRIC_CURRENT here would make the fingerprint change on every
-    // single frame of any window-geometry animation in progress (an open
-    // pop-in, a slide, even an unrelated border-angle loop elsewhere in
-    // Hyprland), forcing a full recomputeAll() — including the O(n^2)
-    // adjacency work and hysteresis evaluated against in-between, not-yet-
-    // settled positions — every frame for as long as anything is animating.
-    // The goal/target geometry only changes once per actual layout change, so
-    // fingerprinting that instead keeps this gate cheap and correct.
+    // Fingerprint the GOAL geometry. CURRENT geometry changes on every frame of a
+    // window animation (open, slide, resize), which would force the O(n^2)
+    // recompute every frame and judge hysteresis against in-between positions.
+    // GOAL geometry changes once per layout change.
     collectVisibleWindows(boxes, windows, workspaces, Desktop::View::IGeometric::GEOMETRIC_GOAL);
 
-    // Don't keep strong window refs alive in these reused statics between ticks
-    // (they'd pin closed windows, and would outlive a plugin unload).
+    // Don't hold strong window refs in the statics between ticks. They would keep
+    // closed windows alive and outlive a plugin unload.
     windows.clear();
 
     const std::size_t fingerprint = fingerprintVisibleWindows(boxes, workspaces);

@@ -4,8 +4,8 @@
 
 namespace {
 struct SPatternMatchResult {
-    bool ok;      // false iff this field has a malformed pattern, or a valid pattern that didn't match
-    bool matched; // true iff this field carried a real (non-empty) constraint
+    bool ok;      // false if the pattern is malformed, or valid but didn't match
+    bool matched; // true if the pattern is non-empty and valid
 };
 
 SPatternMatchResult patternMatches(const std::string& pattern, const std::string& subject) {
@@ -15,7 +15,7 @@ SPatternMatchResult patternMatches(const std::string& pattern, const std::string
     try {
         re = std::regex(pattern);
     } catch (const std::regex_error&) {
-        return {false, false}; // malformed pattern: treat the whole rule as invalid, skip rather than crash
+        return {false, false}; // malformed pattern: skip the whole rule instead of throwing
     }
     return {std::regex_search(subject, re), true};
 }

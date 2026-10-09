@@ -32,10 +32,9 @@ struct SResolvedWindowConfig {
     bool         seamEnabled = false;
 };
 
-// Pure resolution: later-registered rules win on conflict (last match wins),
-// matching Hyprland windowrulev2 semantics. A rule matches when every non-empty
-// pattern it carries (class and/or title) matches; a rule with neither pattern
-// never matches. `isFloating` short-circuits seam resolution to `false`
+// Pure resolution: later-registered rules win on conflict (last match wins). A
+// rule matches when every non-empty pattern it carries (class and/or title)
+// matches; a rule with neither pattern never matches. `isFloating` short-circuits seam resolution to `false`
 // regardless of any rule or global default.
 SResolvedWindowConfig resolveWindowConfig(const std::string& windowClass, const std::string& windowTitle, bool isFloating,
                                           const SGlobalSeamDefaults& defaults, const std::vector<SSeamRule>& rules);

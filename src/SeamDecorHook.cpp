@@ -1,38 +1,34 @@
-// Opt-in border/shadow corner-rounding hooks on the same render-pass-element pattern
-// SeamHook.cpp already uses for window content (hkDrawSurface). Each hook reuses
-// SeamState::liveCornersFor(window) -- already seam-aware, already animated, already
-// per-app-resolved -- and redraws the border/shadow in up to 4 corner-quadrant passes
-// through Hyprland's own g_pHyprOpenGL->renderBorder()/renderRoundedShadow(), mirroring
-// how hkDrawSurface gets per-corner rounding out of renderTexture()'s single `round` field.
+// Opt-in hooks that round border and shadow corners, using the same render-pass-element
+// pattern as hkDrawSurface in SeamHook.cpp. Each hook reads SeamState::liveCornersFor(window),
+// which already accounts for seams, animation and per-app rules, and redraws the border or
+// shadow in up to 4 corner passes through g_pHyprOpenGL->renderBorder()/renderRoundedShadow().
+// That's how hkDrawSurface gets per-corner rounding out of renderTexture()'s single `round`.
 //
-// Confirmed against the installed Hyprland 0.56.2 headers, the upstream 0.56.2 .cpp sources
-// (CHyprBorderDecoration.cpp, CHyprDropShadowDecoration.cpp, GLElementRenderer.cpp, OpenGL.cpp
-// -- not shipped with the dev headers, fetched separately to settle the final review's Critical
-// findings), and the dynamic symbol table (plan
-// docs/superpowers/plans/2026-10-06-border-shadow-rounding.md, Task 1):
-//   - exact demangled draw() overloads for CBorderPassElement/CShadowPassElement below
-//   - g_pHyprRenderer->m_renderData.damage restricts renderBorder()/renderRoundedShadow()
-//     output the same way it restricts drawSurface (empirically confirmed via pixel diff)
-//   - decoration:shadow:color resolves through CConfigValue<Config::IComplexConfigValue>
-//     to a real Config::CGradientValueData
-//   - CBorderPassElement::m_data.box and CHyprDropShadowDecoration::getRenderData()'s fullBox
-//     are both monitor-scaled, rounded-to-int px (CHyprBorderDecoration::draw() and
-//     getRenderData() both end with `.scale(pMonitor->m_scale).round()`) -- the SAME space
-//     hkDrawSurface's windowBox uses. SeamState::liveCornersFor returns LOGICAL px, so both
-//     hooks must multiply by the monitor's scale before comparing against these boxes.
+// Checked against the installed Hyprland 0.56.2 headers, the upstream 0.56.2 .cpp sources
+// (CHyprBorderDecoration.cpp, CHyprDropShadowDecoration.cpp, GLElementRenderer.cpp and
+// OpenGL.cpp, which the dev headers don't include), and the dynamic symbol table:
+//   - The exact demangled draw() overloads for CBorderPassElement/CShadowPassElement are below.
+//   - g_pHyprRenderer->m_renderData.damage limits renderBorder()/renderRoundedShadow() output
+//     the same way it limits drawSurface (tested with a pixel diff).
+//   - decoration:shadow:color resolves through CConfigValue<Config::IComplexConfigValue> to a
+//     Config::CGradientValueData.
+//   - CBorderPassElement::m_data.box and the fullBox from
+//     CHyprDropShadowDecoration::getRenderData() are both in monitor-scaled px rounded to int
+//     (both end with `.scale(pMonitor->m_scale).round()`), the same space as hkDrawSurface's
+//     windowBox. SeamState::liveCornersFor returns logical px, so both hooks multiply by the
+//     monitor scale before comparing.
 //   - renderBorder()'s effective inner radius is `data.round + (data.round == 0 ? 0 :
-//     scaledBorderSize)`, and `data.outerRound == -1` makes it reuse that same effective value
-//     for the outer edge instead of native's separate (whole-window) outerRound -- the correct,
-//     simplest way to get a single matching inner+outer curve for one corner's own radius.
-//   - renderBorder() draws into box.expand(scaledBorderSize), i.e. a ring extending
-//     scaledBorderSize beyond the content box on every edge, so a corner's redraw-restriction
-//     box must extend that far outward too, or the ring outside the content box never gets
-//     repainted and stays square from the straight-edge pass.
-//   - getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow as a side effect (used
-//     by the shadow shader to cut the window's own box out of the fill) and reposition()
-//     clears it at the end of the native render() call -- so it must be reset around the corner
-//     redraws too, and it is also the exact, unambiguous shadow owner: calling getRenderData()
-//     once and reading currentWindow afterwards needs no separate window-matching logic at all.
+//     scaledBorderSize)`. `data.outerRound == -1` reuses that value for the outer edge instead
+//     of native's whole-window outerRound, which gives one matching inner and outer curve for
+//     a single corner's radius.
+//   - renderBorder() draws into box.expand(scaledBorderSize), a ring that reaches
+//     scaledBorderSize past the content box on every side. A corner's redraw box has to reach
+//     that far out too, or the outer part of the ring stays square from the straight-edge pass.
+//   - getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow as a side effect (the
+//     shadow shader uses it to cut the window's box out of the fill), and reposition() clears
+//     it at the end of the native render(). That makes it the shadow's owner: call
+//     getRenderData() once and read currentWindow, with no separate window matching. The
+//     corner redraws leave it unset on purpose; see hkShadowDraw.
 
 #include "SeamDecorHook.hpp"
 #include "SeamState.hpp"
@@ -56,9 +52,8 @@
 #include <string>
 
 namespace {
-    // One corner's redraw box, already in the same monitor-scaled px space as the box it was
-    // computed against, plus the radius to feed Hyprland's own rounded-rect shader for just
-    // that corner.
+    // One corner's redraw box, in the same monitor-scaled px space as the box it came from,
+    // plus the radius for that corner's shader call.
     struct SCornerBox {
         CBox box;
         int  round = 0; // 0 means "no rounding needed here, leave it to the native straight-edge paint"
@@ -68,8 +63,8 @@ namespace {
         SCornerBox topLeft, topRight, bottomLeft, bottomRight;
     };
 
-    // Subtracts each non-empty corner box from `savedDamage`, producing the region the
-    // straight-edge pass should actually paint into.
+    // Subtracts each non-empty corner box from `savedDamage`, giving the region the
+    // straight-edge pass paints into.
     CRegion pruneDamageForBoxes(const CRegion& savedDamage, const SCornerBoxes& boxes) {
         CRegion pruned = savedDamage.copy();
         if (boxes.topLeft.round > 0)
@@ -83,11 +78,9 @@ namespace {
         return pruned;
     }
 
-    // Redraws each non-empty corner box, restricted to just that box via a damage region
-    // intersected with what was actually damaged this frame. `draw` performs one actual
-    // render call for one corner's box/round. Reaches for g_pHyprRenderer->m_renderData
-    // directly (same as hkDrawSurface does) rather than naming its type as a parameter --
-    // SeamHook.cpp never names that type either, it only ever accesses it through `auto&`.
+    // Redraws each non-empty corner box, limited to that box intersected with this frame's
+    // damage. `draw` makes the render call for one corner. Like hkDrawSurface, it reads
+    // g_pHyprRenderer->m_renderData through `auto&` instead of naming its type.
     template <std::invocable<const SCornerBox&> F>
     void forEachCorner(const SCornerBoxes& boxes, const CRegion& savedDamage, F&& draw) {
         auto& renderData = g_pHyprRenderer->m_renderData;
@@ -113,7 +106,7 @@ namespace {
 
     using borderDraw_t = void (*)(void* thisptr, WP<CBorderPassElement> element, const CRegion& damage);
 
-    // Confirmed in Task 1, Step 2 against the installed 0.56.2 headers + dynamic symbol table.
+    // From the installed 0.56.2 headers and the dynamic symbol table.
     constexpr const char* BORDER_DEMANGLED =
         "Render::GL::CGLElementRenderer::draw(Hyprutils::Memory::CWeakPointer<CBorderPassElement>, Hyprutils::Math::CRegion const&)";
 
@@ -121,16 +114,15 @@ namespace {
         return vars.roundBorders && vars.roundBorders->value();
     }
 
-    // Anchored on `box` (the border's content box, pre-expansion), extended outward by
-    // `scaledBorderSize` on the corner's own two outward edges so the redraw box covers the
-    // whole ring renderBorder() paints there (box.expand(scaledBorderSize)), not just the part
-    // inside the content box.
+    // Anchored on `box`, the border's content box before expansion, and extended by
+    // `scaledBorderSize` past the corner's two outer edges, so the redraw box covers the whole
+    // ring renderBorder() paints there (box.expand(scaledBorderSize)).
     SCornerBox makeBorderCornerBox(const CBox& box, bool left, bool top, double liveRadiusPx, double scale, int scaledBorderSize) {
         const double maxR  = std::floor(std::min(box.width, box.height) / 2.0);
         const double r     = std::clamp(liveRadiusPx * scale, 0.0, maxR);
         const int    round = static_cast<int>(std::lround(r));
         if (round <= 0)
-            return SCornerBox{}; // renderBorder's own effective round is 0 too in this case -- native paint is already correct here.
+            return SCornerBox{}; // renderBorder's effective round is 0 here too, so the native paint is already right.
 
         const double innerSize = std::ceil(r);
         const double size      = innerSize + scaledBorderSize;
@@ -178,8 +170,8 @@ namespace {
         const double scale            = mon->m_scale;
         const int    scaledBorderSize = static_cast<int>(std::round(data.borderSize * scale));
 
-        // Same source hkDrawSurface uses for content corners (SeamHook.cpp), not the native
-        // per-window roundingPower, so border/shadow curve exactly like content at each corner.
+        // Same setting hkDrawSurface uses for content corners, not the native per-window
+        // roundingPower, so the border and shadow curve the same way as the content.
         static auto PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float roundingPower = *PPOWER;
 
@@ -203,7 +195,7 @@ namespace {
                 .roundingPower = roundingPower,
                 .borderSize    = data.borderSize,
                 .a             = data.a,
-                .outerRound    = -1, // reuse the same effective (round + borderSize) radius for the outer edge too
+                .outerRound    = -1, // use the same effective (round + borderSize) radius for the outer edge
             };
             if (data.hasGrad2)
                 Render::GL::g_pHyprOpenGL->renderBorder(data.box, data.grad1, data.grad2, data.lerp, perCorner);
@@ -222,10 +214,9 @@ namespace {
         return vars.roundShadows && vars.roundShadows->value();
     }
 
-    // Anchored exactly on `fullBox`'s own corner (fullBox already IS the outermost extent --
-    // window box plus the shadow's range margin on every side), extended inward by the scaled
-    // shadow range so the redraw box covers both the corner's rounded falloff and the blur
-    // margin out to fullBox's edge.
+    // Anchored on `fullBox`'s corner. fullBox is already the outer extent: the window box plus
+    // the shadow range on every side. The box extends inward by the scaled shadow range, so it
+    // covers the corner's rounded falloff and the blur margin out to fullBox's edge.
     SCornerBox makeShadowCornerBox(const CBox& fullBox, bool left, bool top, double liveRadiusPx, double scale, int scaledRange) {
         const double maxR  = std::floor(std::min(fullBox.width, fullBox.height) / 2.0);
         const double r     = std::clamp(liveRadiusPx * scale, 0.0, maxR);
@@ -268,11 +259,8 @@ namespace {
             return;
         }
 
-        // getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow as a side effect --
-        // the exact, unambiguous owner of this shadow decoration. No separate window-matching
-        // needed (the plan's Task 1 constructor-hook design was unusable -- ambiguous symbols
-        // -- and its box-matching fallback compared mismatched coordinate spaces; this reads
-        // Hyprland's own answer directly instead).
+        // getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow to the window that
+        // owns this shadow, so no separate window matching is needed.
         const SShadowRenderData rd = data.deco->getRenderData(mon, data.a);
         if (!rd.valid) {
             callOriginal();
@@ -291,16 +279,16 @@ namespace {
             return;
         }
 
-        // decoration:shadow:sharp draws a flat rect, not the rounded-shadow falloff this hook
-        // assumes -- leave it to native rather than drawing mismatched corners.
+        // decoration:shadow:sharp draws a flat rect without the rounded falloff this hook
+        // expects, so leave it to the native draw.
         static auto PSHADOWSHARP = CConfigValue<Config::INTEGER>("decoration:shadow:sharp");
         if (*PSHADOWSHARP) {
             callOriginal();
             return;
         }
 
-        // The window's own live shadow color/animation state, not the raw global config value
-        // -- covers color_inactive, per-window overrides, and the focus-change fade.
+        // Use the window's live shadow color and fade state instead of the global config
+        // value. That covers color_inactive, per-window overrides and the focus-change fade.
         const bool  animated = window->m_shadowFadeAnimationProgress->isBeingAnimated();
         const auto& grad1    = animated ? window->m_realShadowColorPrevious : window->m_realShadowColor;
         const auto& grad2    = window->m_realShadowColor;
@@ -320,20 +308,15 @@ namespace {
         callOriginal();
         renderData.damage = savedDamage;
 
-        // Deliberately NOT restoring currentWindow here (unlike the native straight pass,
-        // which gets it from its own getRenderData() call via callOriginal()). The shadow
-        // shader's window cutout (renderRoundedShadow in OpenGL.cpp) always sizes itself from
-        // the window's NATIVE rounding -- forced to 0 by this plugin's own required precondition
-        // (decoration:rounding = 0) -- so the cutout is always a hard square, regardless of
-        // what `round` this call passes for the glow shape itself. Restoring currentWindow for
-        // a *rounded* corner redraw subtracts that square cutout from a round glow silhouette,
-        // leaving a small triangular notch of raw background at the exact corner tip where the
-        // round curve and the square cutout disagree (confirmed by reading the cutout math:
-        // OpenGL.cpp ~2412-2438, `cutoutRadius` from `PWINDOW->rounding() * scale`). Skipping
-        // the cutout for corners trades that hard, geometrically-visible notch for a much
-        // smaller cost: a translucent window's corner shadow isn't cut out from directly under
-        // its own (rounded) content there, same as this hook's behavior before the window-cutout
-        // fix was added -- a soft tint under a small rounded sliver, not a hole in the curve.
+        // currentWindow is left unset for the corner redraws. The straight pass gets it from
+        // its own getRenderData() call inside callOriginal(). The shadow shader's window cutout
+        // (renderRoundedShadow in OpenGL.cpp, ~2412-2438, `cutoutRadius` from
+        // `PWINDOW->rounding() * scale`) is sized from the window's native rounding, which the
+        // plugin requires to be 0, so the cutout is always a hard square whatever `round` this
+        // call passes. On a rounded corner, that square cutout would leave a small triangular
+        // notch of background at the corner tip. Without the cutout, a translucent window's
+        // corner shadow shows through a small rounded sliver of its content as a soft tint,
+        // which is much less visible than the notch.
         forEachCorner(boxes, savedDamage, [&](const SCornerBox& patch) {
             if (animated)
                 Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, roundingPower, scaledRange, grad1, grad2, lerp, data.a);
@@ -358,9 +341,8 @@ namespace {
         void*   address = nullptr;
     };
 
-    // Finds exactly one function whose demangled name equals `demangled`. Refuses (Ambiguous)
-    // rather than guessing if more than one exact match exists. Mirrors SeamHook.cpp's
-    // findExact (deliberately not shared across files -- see File Structure in the plan).
+    // Finds the one function whose demangled name equals `demangled`. Returns Ambiguous if
+    // there is more than one exact match. Same as SeamHook.cpp's findExact.
     SLookupResult findExact(const std::string& shortName, const char* demangled) {
         void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {

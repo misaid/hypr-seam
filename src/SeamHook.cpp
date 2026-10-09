@@ -1,34 +1,31 @@
-// Real per-corner rendering hook on Render::IElementRenderer::drawSurface (Task 7).
+// Per-corner rendering hook on Render::IElementRenderer::drawSurface.
 //
-// See docs/hook-notes.md (Task 6) for the confirmed signature, calling convention, and the
-// three "viable levers" this body is built from. Summary of the approach (lever 3 there):
+// Approach:
 //
-//   1. Paint the main window body once, through the real original, with its damage region
-//      temporarily shrunk to exclude the 4 live corner boxes, and `dontRound` forced on so
-//      the body paints as a plain square everywhere except those corners (native rounding
-//      is globally forced to 0 anyway via `decoration:rounding = 0`).
-//   2. Separately, once per corner, redraw the SAME window texture via Hyprland's own
-//      g_pHyprOpenGL->renderTexture(), restricted (via a damage region containing only that
-//      corner's box) to just that corner, passing THAT corner's own live radius as `.round`.
-//      Hyprland's own rounded-rect shader does the rest — no custom GLSL needed.
+//   1. Paint the window body once through the original function, with its damage region
+//      shrunk to exclude the 4 corner boxes and `dontRound` forced on, so the body is a
+//      plain square outside the corners. (Native rounding is already 0, because the
+//      plugin requires `decoration:rounding = 0`.)
+//   2. Redraw the same window texture once per corner with g_pHyprOpenGL->renderTexture(),
+//      limited to that corner's box by a damage region and passing that corner's live
+//      radius as `.round`. Hyprland's rounded-rect shader draws the curve, so no custom
+//      GLSL is needed.
+//   3. The corner draws use the same UV mapping as the body, recomputed through Hyprland's
+//      exported IElementRenderer::calculateUVForSurface. Corners and body then sample the
+//      same texels, even during open/resize/reflow animations, when the client's buffer
+//      size lags the animated window box on most frames.
 //
-//   3. The corner draws reuse the exact UV mapping the body paint used, recomputed through
-//      Hyprland's own (exported) IElementRenderer::calculateUVForSurface, so corners and body
-//      always sample the same texels — including during open/resize/reflow animations, when
-//      the client's buffer size lags the animated window box on nearly every frame.
+// This works because g_pHyprRenderer->m_renderData.damage is what restricts drawing;
+// drawSurface never reads its `damage` parameter (checked in source and by testing). It
+// doesn't work when m_renderData.clipBox is set, for example on a floating window during
+// a slide animation. For that frame the window is drawn natively with square corners.
+// Surfaces Hyprland marks dontRound (internal fullscreen) are also drawn natively.
 //
-// This relies on g_pHyprRenderer->m_renderData.damage being the thing that actually
-// restricts drawing (confirmed empirically + from source: the `damage` *parameter* to
-// drawSurface is never read). It does NOT work when m_renderData.clipBox is non-empty
-// (e.g. a floating window mid slide-animation) — in that rare case we fall back to the
-// native, square-cornered draw for that one frame rather than risk a corrupted clip.
-// Surfaces Hyprland itself marks dontRound (internal fullscreen) are also left native.
-//
-// Subsurfaces are left native by default too. That is why Firefox-based browsers (Firefox,
-// Zen, ...) stay square: they draw their whole page into a wl_subsurface that exactly covers
-// the main surface, so the main surface's rounded corners are hidden underneath it. With
-// plugin:seam:force_round_risky_surfaces = true, a subsurface that reaches one or more of the
-// window's own corners gets those corners rounded too (see subsurfaceCorners()).
+// Subsurfaces are drawn natively by default too, which is why Firefox-based browsers
+// (Firefox, Zen, ...) stay square. They draw the whole page into a wl_subsurface that
+// covers the main surface and hides its rounded corners. With
+// plugin:seam:force_round_risky_surfaces = true, a subsurface that reaches a window corner
+// gets that corner rounded (see subsurfaceCorners()).
 #define WLR_USE_UNSTABLE
 
 #include "SeamHook.hpp"
@@ -60,25 +57,22 @@
 namespace {
     CFunctionHook* g_hook = nullptr;
 
-    // Confirmed against /usr/include/hyprland/src/render/ElementRenderer.hpp (Hyprland 0.56.2):
+    // From /usr/include/hyprland/src/render/ElementRenderer.hpp (Hyprland 0.56.2):
     //   void Render::IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegion& damage);
-    // A private, NON-virtual member function. Under the Itanium C++ ABI a non-virtual
-    // member is called exactly like a free function with the object pointer prepended
-    // as the first argument, so `this` is modelled as an explicit leading void*.
-    // WP<> is non-trivially-copyable, so it is passed by invisible reference in both
-    // the original and our replacement; declaring the same C++ parameter types makes
-    // the compiler produce a matching ABI on both sides.
+    // It's a private, non-virtual member. Under the Itanium C++ ABI, a non-virtual member
+    // is called like a free function with the object pointer as the first argument, so
+    // `this` is an explicit leading void* here. WP<> isn't trivially copyable, so both the
+    // original and the replacement take it by invisible reference; declaring the same C++
+    // parameter types gives both sides the same ABI.
     using drawSurface_t = void (*)(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage);
 
     constexpr const char* TARGET_DEMANGLED = "Render::IElementRenderer::drawSurface(Hyprutils::Memory::CWeakPointer<CSurfacePassElement>, Hyprutils::Math::CRegion const&)";
 
-    // Confirmed against /usr/include/hyprland/src/render/ElementRenderer.hpp (0.56.2) and the
-    // binary's dynamic symbol table (`nm -DC /usr/bin/Hyprland`): calculateUVForSurface is a
-    // private, non-virtual member of IElementRenderer, but its symbol IS exported, so it can be
-    // located via findFunctionsByName and called with the same leading-`this` convention as
-    // drawSurface above. SP<> arguments are non-trivially-copyable, so they're passed by
-    // invisible reference on both sides — declaring the same C++ parameter types gives a
-    // matching ABI.
+    // Per ElementRenderer.hpp (0.56.2) and `nm -DC /usr/bin/Hyprland`, calculateUVForSurface
+    // is a private, non-virtual member of IElementRenderer whose symbol is exported.
+    // findFunctionsByName can find it, and it's called with the same leading-`this`
+    // convention as drawSurface. SP<> arguments aren't trivially copyable, so they go by
+    // invisible reference; the same C++ parameter types give a matching ABI.
     using calculateUV_t = void (*)(void* thisptr, PHLWINDOW, SP<CWLSurfaceResource>, PHLMONITOR, bool main, const Vector2D& projSize, const Vector2D& projSizeUnscaled,
                                    bool fixMisalignedFSV1);
 
@@ -88,32 +82,28 @@ namespace {
 
     calculateUV_t g_calculateUV = nullptr;
 
-    // One corner's redraw box (in the same monitor-scaled, rounded pixel space as the
-    // windowBox drawSurface itself computes) plus the radius to feed Hyprland's own
-    // rounded-rect shader for just that corner.
+    // One corner's redraw box, in the same monitor-scaled, rounded pixel space as the
+    // windowBox drawSurface computes, plus the radius for that corner's shader call.
     //
-    // The box is always snapped OUTWARD to whole pixels (size = ceil(radius), anchored on the
-    // window's own integer edge). windowBox is already rounded to integers, so this makes the
-    // box exactly integral. That matters because CRegion(CBox) hands the double coordinates
-    // straight to pixman_region32_init_rect, which truncates x and width independently: with a
-    // fractional radius (fractional monitor scale, or mid-animation) a right/bottom patch at
-    // `edge - 16.5` became [edge-17, edge-1), leaving the outermost pixel column/row OUT of the
-    // pruned-away region, so the square body paint showed through as a 1px sliver beside the
-    // curve. The same integral box is used for both the damage subtraction and the corner-draw
-    // restriction, so the two can never disagree. `.round` stays the (rounded) real radius,
-    // since it controls the actual curve shape; the extra <1px of box beyond the curve is just
-    // painted as plain body by the corner draw.
+    // The box snaps outward to whole pixels: its size is ceil(radius), anchored on the
+    // window's integer edge, and windowBox is already integral. CRegion(CBox) passes double
+    // coordinates to pixman_region32_init_rect, which truncates x and width separately. With
+    // a fractional radius (fractional scale, or mid-animation), a right or bottom patch at
+    // `edge - 16.5` becomes [edge-17, edge-1), which leaves the outer pixel column or row out
+    // of the pruned region, and the square body shows through as a 1px sliver beside the
+    // curve. The damage subtraction and the corner draw use the same box, so they always
+    // agree. `.round` is the real radius rounded to an int, since it sets the curve; the
+    // corner draw paints the extra <1px of box as plain body.
     struct SCornerPatch {
         CBox box;
         int  round = 0; // scaled px; 0 means "no rounding needed here, leave it to the square body paint"
     };
 
     SCornerPatch makeCornerPatch(const CBox& windowBox, bool left, bool top, double liveRadiusLogicalPx, double monitorScale) {
-        // liveRadiusLogicalPx comes from SeamState::liveCornersFor, already clamped against
-        // the window's logical size (Task 5's clampCornerRadius). Re-clamp here defensively
-        // against windowBox's own (scaled, rounded-to-int) dimensions anyway, since windowBox
-        // can differ very slightly from the logical size SeamState clamped against (min-size
-        // floor, rounding to whole scaled pixels).
+        // liveRadiusLogicalPx comes from SeamState::liveCornersFor, already clamped to the
+        // window's logical size (clampCornerRadius in Adjacency.hpp). Clamp again against
+        // windowBox, which is scaled and rounded and can differ slightly from that logical
+        // size (min-size floor, rounding to whole scaled pixels).
         double       r    = std::max(0.0, liveRadiusLogicalPx) * monitorScale;
         const double maxR = std::floor(std::min(windowBox.width, windowBox.height) / 2.0);
         r                 = std::clamp(r, 0.0, maxR);
@@ -142,8 +132,8 @@ namespace {
         };
     }
 
-    // Subtracts each non-empty corner patch's box from `savedDamage`, producing the region
-    // the main body should actually paint into (everything except the 4 corner squares).
+    // Subtracts each non-empty corner patch from `savedDamage`, giving the region the body
+    // paints into: everything except the 4 corner squares.
     CRegion pruneDamageForPatches(const CRegion& savedDamage, const SCornerPatches& patches) {
         CRegion pruned = savedDamage.copy();
         if (patches.topLeft.round > 0)
@@ -161,10 +151,9 @@ namespace {
         Vector2D topLeft, bottomRight;
     };
 
-    // Redraws each corner with its own live radius, restricted to just that corner's box via
-    // a damage region containing only it (intersected with what was actually damaged this
-    // frame). Hyprland's own rounded-rect shader (invoked once per corner with that corner's
-    // own radius) is the per-corner-radius mechanism — no custom GLSL needed.
+    // Redraws each corner with its own live radius, limited to that corner's box (intersected
+    // with this frame's damage). Calling Hyprland's rounded-rect shader once per corner is
+    // what gives each corner its own radius.
     void drawCorners(const SCornerPatches& patches, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const CRegion& savedDamage,
                       const SUVMapping& uv, float roundingPower) {
         auto        PSURFACE = Desktop::View::CWLSurface::fromResource(data.surface);
@@ -204,9 +193,9 @@ namespace {
         return vars.forceRoundRiskySurfaces && vars.forceRoundRiskySurfaces->value();
     }
 
-    // The window's own frame box (data.pos + data.w/h, i.e. the main surface's box without
-    // the small-surface centering), in the same monitor-scaled, rounded pixel space as
-    // hkDrawSurface's windowBox. Built the same way getTexBox() builds a box.
+    // The window's frame box (data.pos + data.w/h: the main surface's box without the
+    // small-surface centering), in the same monitor-scaled, rounded pixel space as
+    // hkDrawSurface's windowBox. Built the same way getTexBox() builds its box.
     CBox windowFrameBox(const CSurfacePassElement::SRenderData& data) {
         const auto& mon = data.pMonitor;
         CBox        box{sc<int>(-mon->m_position.x) + data.pos.x, sc<int>(-mon->m_position.y) + data.pos.y, data.w, data.h};
@@ -215,12 +204,12 @@ namespace {
         return box;
     }
 
-    // For a subsurface (only reached with force_round_risky_surfaces on): keep a corner's live
-    // radius only where the subsurface's own corner sits on the window's corner, zero the rest.
-    // A subsurface that reaches a window corner covers the main surface's rounded corner there,
-    // so it has to be cut the same way or the window looks square. A subsurface that doesn't
-    // reach a corner (a video, a toolbar strip in the middle) must NOT be rounded at all. The
-    // 1px slack absorbs rounding differences between the two boxes.
+    // For a subsurface (only with force_round_risky_surfaces on): keep a corner's live radius
+    // only where the subsurface's corner sits on the window's corner, and zero the rest. A
+    // subsurface that reaches a window corner covers the main surface's rounded corner, so it
+    // needs the same cut or the window looks square. One that reaches no corner (a video, a
+    // toolbar strip in the middle) must not be rounded. The 1px slack absorbs rounding
+    // differences between the two boxes.
     SeamState::SLiveCorners subsurfaceCorners(const SeamState::SLiveCorners& live, const CBox& surfBox, const CBox& frame) {
         auto near = [](double a, double b) { return std::abs(a - b) <= 1.0; };
 
@@ -237,10 +226,9 @@ namespace {
         };
     }
 
-    // Replicates drawSurface's own MISALIGNEDFSV1 boolean exactly (ElementRenderer.cpp,
-    // confirmed against the pinned 0.56.2 source) from the same public fields drawSurface
-    // reads, so we can hand calculateUVForSurface the same `fixMisalignedFSV1` argument the
-    // real body draw used.
+    // Copies drawSurface's MISALIGNEDFSV1 check (ElementRenderer.cpp, 0.56.2) from the same
+    // public fields drawSurface reads, so calculateUVForSurface gets the same
+    // `fixMisalignedFSV1` argument the body draw used.
     bool misalignedFSv1(const CSurfacePassElement::SRenderData& data, const CBox& windowBox) {
         const auto& surf = data.surface->m_current;
 
@@ -253,17 +241,14 @@ namespace {
             (!data.pLS || (!data.pLS->sizeAnimation()->isBeingAnimated()));
     }
 
-    // Reproduces the exact UV mapping the body paint just used. drawSurface computes it via
-    // calculateUVForSurface into m_renderData.primarySurfaceUV* and then resets those back
-    // to (-1,-1) in a scope guard on exit, so it's gone by now — recompute it with the very
-    // same arguments drawSurface passed (same windowBox, unscaled tex-box size, and our
-    // exact MISALIGNEDFSV1 replica), read it out, and put the globals back to the "no
-    // custom UV" state drawSurface left them in. This covers every case calculateUV
-    // handles (viewporter source crops, expand_undersized_textures, the resize/animation
-    // RATIO crop, fractional-scale misalignment) without guessing, so the corners always
-    // sample the same texels as the body right next to them — including during
-    // open/resize/reflow animations, where the buffer size lags the animated box on
-    // nearly every frame.
+    // Reproduces the UV mapping the body paint used. drawSurface computes it with
+    // calculateUVForSurface into m_renderData.primarySurfaceUV*, then a scope guard resets
+    // those to (-1,-1) on exit. So call it again with the same arguments (same windowBox,
+    // unscaled tex-box size, and the MISALIGNEDFSV1 copy), read the result, and reset the
+    // globals to the "no custom UV" state. This covers every case calculateUV handles
+    // (viewporter source crops, expand_undersized_textures, the resize/animation RATIO crop,
+    // fractional-scale misalignment), so the corners sample the same texels as the body next
+    // to them, even while the buffer size lags the animated box.
     SUVMapping recomputeUV(void* thisptr, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const Vector2D& projSizeUnscaled,
                            Render::SRenderData& renderData) {
         (*g_calculateUV)(thisptr, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled,
@@ -275,9 +260,9 @@ namespace {
     }
 
     void hkDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
-        // Never .lock() this WP: it points at a UP<>-owned render-pass element, and
-        // WP::lock() hard-asserts over a CUniquePointer (docs/hook-notes.md). Use
-        // expired()/get() instead, and never retain the raw pointer past this call.
+        // Never .lock() this WP. It points at a UP<>-owned render-pass element, and
+        // WP::lock() asserts on a CUniquePointer. Use expired()/get(), and don't keep the
+        // raw pointer past this call.
         const auto callOriginal = [&]() { (*reinterpret_cast<drawSurface_t>(g_hook->m_original))(thisptr, element, damage); };
 
         if (element.expired()) {
@@ -288,34 +273,31 @@ namespace {
         auto* el   = element.get();
         auto& data = el->m_data;
 
-        // Only act on window surfaces. Popups and layer-shell surfaces (pWindow null, or popup
-        // true) always pass straight through to native handling untouched
-        // (docs/hook-notes.md).
+        // Only window surfaces. Popups and layer-shell surfaces (popup true, or pWindow null)
+        // go straight to the native draw.
         if (!data.pWindow || data.popup || !data.pMonitor || !data.texture || !data.surface) {
             callOriginal();
             return;
         }
 
-        // Subsurfaces are native (square) unless force_round_risky_surfaces is on. This is the
-        // check that leaves Firefox/Zen square: their page content is a full-window subsurface.
+        // Subsurfaces are drawn natively (square) unless force_round_risky_surfaces is on. This
+        // check is why Firefox/Zen stay square: their page content is a full-window subsurface.
         const bool isSubsurface = !data.mainSurface;
         if (isSubsurface && !forceRoundRiskySurfaces()) {
             callOriginal();
             return;
         }
 
-        // Hyprland already decided this surface must not be rounded at all this frame
-        // (Renderer.cpp sets dontRound for a window in internal FSMODE_FULLSCREEN; it's also
-        // the SRenderData default for anything renderWindow doesn't explicitly round). Respect
-        // that: draw exactly as native would, with no per-corner rounding of our own.
+        // Hyprland has decided this surface isn't rounded this frame. Renderer.cpp sets
+        // dontRound for a window in internal FSMODE_FULLSCREEN, and it's the SRenderData
+        // default for anything renderWindow doesn't round. Draw it natively.
         if (data.dontRound) {
             callOriginal();
             return;
         }
 
-        // The real drawSurface discards early if the texture failed to upload; our own
-        // renderTexture calls below would instead hard RASSERT on a not-ok texture. Bail
-        // out the same way the original does rather than risk that.
+        // drawSurface returns early if the texture failed to upload, but the renderTexture
+        // calls below would RASSERT on a bad texture, so hand it to the original instead.
         if (!data.texture->ok()) {
             callOriginal();
             return;
@@ -329,21 +311,18 @@ namespace {
 
         auto& renderData = g_pHyprRenderer->m_renderData;
 
-        // preDrawSurface already copied element->m_data.clipBox into
-        // g_pHyprRenderer->m_renderData.clipBox before this hook ran. When it's non-empty
-        // (e.g. a floating window mid workspace-slide-animation), renderTextureInternal
-        // bypasses damage entirely and clips to clipBox∩clipRegion instead — a single CBox
-        // that can't express "window minus 4 corner squares". Fall back to the native,
-        // square-cornered draw for that one frame rather than risk a corrupted clip
-        // (docs/hook-notes.md, lever 2's caveat).
+        // preDrawSurface has already copied element->m_data.clipBox into
+        // g_pHyprRenderer->m_renderData.clipBox. When it's set (for example, a floating window
+        // during a workspace slide), renderTextureInternal ignores damage and clips to
+        // clipBox∩clipRegion. A single CBox can't express "window minus 4 corner squares", so
+        // draw natively, with square corners, for that frame.
         if (!renderData.clipBox.empty()) {
             callOriginal();
             return;
         }
 
-        // Same windowBox drawSurface itself computes right before using it (getTexBox() is
-        // cached on the element after the first call within this frame, so our call here and
-        // the real body's later call both see the identical box).
+        // The same windowBox drawSurface computes. getTexBox() is cached on the element after
+        // its first call in a frame, so this call and the body draw see the same box.
         CBox windowBox = el->getTexBox();
         windowBox.scale(data.pMonitor->m_scale);
         windowBox.round();
@@ -353,8 +332,8 @@ namespace {
             return;
         }
 
-        // Main surface: all four live corners. Subsurface: only the corners it shares with the
-        // window; one that reaches none of them is drawn natively.
+        // A main surface gets all four live corners. A subsurface gets only the corners it
+        // shares with the window, and one that shares none is drawn natively.
         const SeamState::SLiveCorners radii = isSubsurface ? subsurfaceCorners(*corners, windowBox, windowFrameBox(data)) : *corners;
         if (isSubsurface && radii.topLeft <= 0 && radii.topRight <= 0 && radii.bottomLeft <= 0 && radii.bottomRight <= 0) {
             callOriginal();
@@ -367,12 +346,11 @@ namespace {
 
         const SCornerPatches patches = computeCornerPatches(windowBox, radii, scale);
 
-        // Save the actual region the original draws into (the `damage` parameter is never
-        // read by drawSurface — confirmed in docs/hook-notes.md), subtract the 4 corner
-        // boxes, and force the main body to paint as a plain square. Restored immediately
-        // after the call below: later pass elements in this same frame rely on
-        // m_renderData.damage, and our own corner draws need the ORIGINAL (unpruned) damage
-        // to intersect against, not the pruned one.
+        // Save the region the original draws into (m_renderData.damage, not the unused
+        // `damage` parameter), subtract the 4 corner boxes, and force the body to paint as a
+        // plain square. Both are restored right after the call: later pass elements in this
+        // frame read m_renderData.damage, and the corner draws intersect against the
+        // unpruned damage.
         const CRegion savedDamage    = renderData.damage;
         const bool    savedDontRound = data.dontRound;
 
@@ -391,28 +369,26 @@ namespace {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Second hook: CSurfacePassElement::opaqueRegion() (black/stale-corner fix).
+    // Second hook: CSurfacePassElement::opaqueRegion(), which fixes black or stale corners.
     //
-    // Confirmed against /usr/include/hyprland/src/render/pass/SurfacePassElement.hpp (0.56.2):
-    //   virtual CRegion CSurfacePassElement::opaqueRegion();   // public, VIRTUAL, no params
+    // From /usr/include/hyprland/src/render/pass/SurfacePassElement.hpp (0.56.2):
+    //   virtual CRegion CSurfacePassElement::opaqueRegion();   // public, virtual, no params
     // and the exported symbol `CSurfacePassElement::opaqueRegion()` (nm -DC /usr/bin/Hyprland).
-    // Different convention from drawSurface: it RETURNS a non-trivially-copyable CRegion by
-    // value, so the Itanium ABI returns it through a hidden caller-allocated slot passed in
-    // rdi, with `this` moved to rsi (confirmed by disassembling the installed function:
-    // rdi is kept as the result slot, [rsi+0x50] is read as m_data.surface). A free function
-    // `CRegion f(void*)` lowers identically (sret in rdi, the void* in rsi), so declaring the
+    // It returns a CRegion by value, which isn't trivially copyable, so the Itanium ABI passes
+    // a hidden result slot in rdi and moves `this` to rsi. Disassembling the installed
+    // function shows rdi kept as the result slot and [rsi+0x50] read as m_data.surface. A free
+    // function `CRegion f(void*)` lowers the same way (sret in rdi, the void* in rsi), so the
     // same C++ return type on both sides gives a matching ABI. Hooking the function body
-    // (rather than the vtable slot) covers every virtual dispatch, since the vtable points at
-    // this body; CSurfacePassElement has single, non-virtual inheritance from IPassElement,
-    // so `this` is the CSurfacePassElement* with no adjustment.
+    // instead of the vtable slot covers every virtual call, since the vtable points at this
+    // body. CSurfacePassElement inherits singly and non-virtually from IPassElement, so `this`
+    // needs no adjustment.
     //
-    // Why: with `decoration:rounding = 0`, m_data.rounding is 0, so the original reports the
-    // whole window box as opaque. CRenderPass::simplify() then subtracts that from the damage
-    // of everything underneath (wallpaper, other windows, the clear pass), so the corner
-    // cutouts our drawSurface hook leaves are never repainted and show black/stale content.
-    // We subtract each live corner's box from the reported region so the backdrop under the
-    // corners is drawn again. Making the opaque region SMALLER is always safe: it can only
-    // cause extra (correct) drawing underneath, never missing drawing.
+    // With `decoration:rounding = 0`, m_data.rounding is 0 and the original reports the whole
+    // window box as opaque. CRenderPass::simplify() subtracts that from the damage of
+    // everything underneath (wallpaper, other windows, the clear pass), so the corner cutouts
+    // hkDrawSurface leaves are never repainted and show black or stale content. Subtracting
+    // each live corner's box from the region gets the backdrop under the corners drawn again.
+    // A smaller opaque region only causes extra drawing underneath, so it's always safe.
     using opaqueRegion_t = CRegion (*)(void* thisptr);
 
     constexpr const char* OPAQUE_DEMANGLED = "CSurfacePassElement::opaqueRegion()";
@@ -427,10 +403,9 @@ namespace {
         auto*       el   = static_cast<CSurfacePassElement*>(thisptr);
         const auto& data = el->m_data;
 
-        // Same filter as hkDrawSurface: only main window surfaces our render hook may round.
-        // dontRound surfaces (internal fullscreen) are drawn square by hkDrawSurface, so their
-        // native opaque region is already correct; leave them alone so a fullscreen window
-        // keeps occluding everything beneath it at full efficiency.
+        // Same filter as hkDrawSurface: only surfaces the render hook may round. dontRound
+        // surfaces (internal fullscreen) are drawn square, so their native opaque region is
+        // already right, and a fullscreen window keeps fully occluding what's beneath it.
         if (!data.pWindow || data.popup || data.dontRound || !data.pMonitor)
             return region;
         if (!data.mainSurface && !forceRoundRiskySurfaces())
@@ -440,17 +415,16 @@ namespace {
         if (!corners)
             return region;
 
-        // opaqueRegion() is in monitor-local LOGICAL coordinates (PassElement.hpp); getTexBox()
-        // is the same logical box hkDrawSurface scales/rounds into its windowBox. simplify()
-        // later scales every rect by the monitor scale and rounds it, and hkDrawSurface's own
-        // patches are ceil(radius * scale) scaled px anchored on a rounded edge, so pad each
-        // cut-out by 2 logical px and snap it outward to whole logical px. Over-cutting a sliver
-        // only means a few extra backdrop pixels get painted (then covered by our corner draw);
-        // under-cutting would leave a black/stale fringe.
-        // A subsurface (force_round_risky_surfaces only) gets the WINDOW's corner boxes cut out,
-        // not its own: those are where hkDrawSurface may round it. Cutting them from a
-        // subsurface that doesn't actually reach a corner just costs a little extra backdrop
-        // drawing, which is always safe.
+        // opaqueRegion() is in monitor-local logical coordinates (PassElement.hpp), and
+        // getTexBox() is the logical box hkDrawSurface scales and rounds into its windowBox.
+        // simplify() later scales and rounds every rect, and hkDrawSurface's patches are
+        // ceil(radius * scale) scaled px anchored on a rounded edge, so each cut-out is padded
+        // by 2 logical px and snapped outward to whole logical px. Cutting too much paints a
+        // few extra backdrop pixels that the corner draw then covers; cutting too little leaves
+        // a black or stale fringe.
+        // A subsurface (force_round_risky_surfaces only) gets the window's corner boxes cut
+        // out, since that's where hkDrawSurface may round it. For a subsurface that doesn't
+        // reach a corner, that only costs a little extra backdrop drawing.
         const CBox texBox = data.mainSurface ? el->getTexBox() : CBox{data.pos - data.pMonitor->m_position, Vector2D{data.w, data.h}};
         if (texBox.width <= 0 || texBox.height <= 0)
             return region;
@@ -491,8 +465,8 @@ namespace {
         void*   address = nullptr;
     };
 
-    // Finds exactly one function whose demangled name equals `demangled`. Refuses (Ambiguous)
-    // rather than guessing if more than one exact match exists.
+    // Finds the one function whose demangled name equals `demangled`. Returns Ambiguous if
+    // there is more than one exact match.
     SLookupResult findExact(const std::string& shortName, const char* demangled) {
         void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
@@ -525,9 +499,8 @@ bool SeamHook::install() {
         return false;
     void* target = drawSurfaceLookup.address;
 
-    // Required too: without it the corner patches can't reproduce the body's UV mapping (see
-    // hkDrawSurface), so don't install the render hook at all rather than draw mismatched
-    // corners.
+    // Also required. Without it the corner patches can't reproduce the body's UV mapping
+    // (see hkDrawSurface), so skip the render hook instead of drawing mismatched corners.
     const auto calcUVLookup = findExact("calculateUVForSurface", CALCUV_DEMANGLED);
     if (reportLookupFailure(calcUVLookup.status, "calculateUVForSurface"))
         return false;
@@ -546,9 +519,9 @@ bool SeamHook::install() {
 
     Log::logger->log(Log::DEBUG, "[hypr-seam] drawSurface hook installed @ {}", target);
 
-    // opaqueRegion hook (black/stale-corner fix). Not fatal if it can't be installed: the
-    // corners still render, they just may show black/stale content behind opaque windows.
-    // Warn loudly instead of tearing down the working render hook.
+    // opaqueRegion hook (black/stale corner fix). If it can't be installed, corners still
+    // render but may show black or stale content behind opaque windows, so warn and keep
+    // the render hook.
     const auto  opaqueLookup = findExact("opaqueRegion", OPAQUE_DEMANGLED);
     void* const opaqueTarget = opaqueLookup.address;
     if (opaqueLookup.status != eLookup::Found) {

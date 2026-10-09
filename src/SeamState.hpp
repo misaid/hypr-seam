@@ -7,54 +7,45 @@
 
 // Tracks every mapped window's live, animated corner-radius state and keeps it in
 // sync with adjacency (Adjacency.hpp) + per-window config (SeamConfig.hpp).
-//
-// Consumes (do not modify): SSeamBox/computeTouchingCorners/clampCornerRadius (Task 2),
-// SResolvedWindowConfig/resolveWindowConfig (Task 3), SeamRuleStore::rules() and
-// currentGlobalDefaults() (Task 4).
 namespace SeamState {
     struct SLiveCorners {
         double topLeft, topRight, bottomLeft, bottomRight;
     };
 
-    // Recomputes adjacency + resolved config for every tracked window and retargets
-    // its animated corner radii accordingly. Called on every event that can change
-    // which corners touch a neighbor: window open/close/floating-toggle/fullscreen,
-    // workspace change, monitor add/remove/layout change, config reload, and (via
-    // the tick-gated fallback in main.cpp, since Hyprland has no standalone
-    // window-move/resize event) whenever a tracked window's position/size actually
-    // changed. Judges adjacency against each window's GOAL geometry, not its live
-    // animated position, so a recompute that happens to fire mid-animation still
-    // judges against the final, settled layout rather than a transient frame.
+    // Recomputes adjacency and resolved config for every tracked window and retargets
+    // its animated corner radii. Runs on every event that can change which corners
+    // touch a neighbor: window open/close/floating/fullscreen, workspace change,
+    // monitor add/remove/layout change, and config reload. Hyprland has no
+    // window-move/resize event, so the tick fallback in main.cpp also calls it when a
+    // window's position or size changes. Adjacency uses each window's GOAL geometry,
+    // so a recompute that fires mid-animation sees the final layout.
     void recomputeAll();
 
-    // Per-window live corner radii, read every frame by the render hook (Task 7).
-    // Returns std::nullopt if the window isn't tracked (shouldn't happen for mapped windows).
+    // Per-window live corner radii, read every frame by the render hooks (SeamHook.cpp, SeamDecorHook.cpp).
+    // Returns std::nullopt if the window isn't tracked (mapped windows always are).
     std::optional<SLiveCorners> liveCornersFor(const PHLWINDOW& window);
 
     void onWindowOpened(const PHLWINDOW& window);
     void onWindowClosed(const PHLWINDOW& window);
 
-    // Drops every tracked window entry (and its animated variables) and cancels
-    // any pending deferred recompute. Called from PLUGIN_EXIT so no window refs,
-    // animated vars, or queued callbacks outlive the plugin.
+    // Drops every tracked window entry and its animated variables, and cancels any
+    // pending deferred recompute. PLUGIN_EXIT calls this so that no window refs,
+    // animated vars or queued callbacks outlive the plugin.
     void clear();
 
-    // Hyprland's event bus has no standalone "window moved/resized" event (confirmed
-    // against the installed EventBus.hpp — only open/close/floating/fullscreen/
-    // moveToWorkspace exist for windows). Call this from a `tick` listener in
-    // main.cpp; it cheaply fingerprints every mapped window's GOAL position/size/
-    // floating state and only runs the full recomputeAll() when that fingerprint
-    // changed since the last call. Note: `tick` is not a continuous per-frame
-    // heartbeat (confirmed empirically) — it fires in bursts while the compositor
-    // is actively rendering and goes silent once idle, so this is a best-effort
-    // catch-all, not a guaranteed poll; recomputeAll()'s own use of GOAL geometry
-    // (rather than relying on a trailing tick to "settle" the result) is what
-    // actually keeps the result correct regardless of when this fires.
+    // Hyprland's event bus has no window move/resize event (EventBus.hpp only has
+    // open, close, floating, fullscreen and moveToWorkspace for windows). main.cpp
+    // calls this from its `tick` listener. It fingerprints every mapped window's GOAL
+    // position, size and floating state, and runs recomputeAll() only when the
+    // fingerprint changed since the last call.
+    //
+    // `tick` fires in bursts while the compositor renders and stops when it goes
+    // idle, so this is a best-effort catch-all. Correctness comes from
+    // recomputeAll() using GOAL geometry, which doesn't depend on when this fires.
     void onTick();
 
-    // Diagnostic only (backs the `seam:debugstate` dispatcher in main.cpp): dumps
-    // every tracked window's live corner radii and touching state ('*' = corner
-    // currently flagged as touching) as a human-readable string. Not used by the
-    // render path; kept as a troubleshooting aid for bug reports.
+    // Backs the `seam:debugstate` dispatcher in main.cpp. Returns every tracked
+    // window's live corner radii as text, with '*' after each corner currently
+    // flagged as touching. The render path doesn't use it; it's for bug reports.
     std::string debugDump();
 }

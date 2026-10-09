@@ -31,6 +31,5 @@ struct SVars {
 inline SVars vars = {};
 
 // Builds the resolved global seam defaults from the live plugin:seam:* config values.
-// Defined (non-static, intentionally) in main.cpp so other translation units (e.g.
-// Task 5's SeamState.cpp) can call it directly.
+// Defined in main.cpp; SeamState.cpp calls it on every recompute.
 SGlobalSeamDefaults currentGlobalDefaults();
