@@ -68,6 +68,52 @@ on every start.
 
 ## Configuration
 
+### Example
+
+A plain hyprlang `.conf` snippet covering the common options:
+
+```
+plugin:seam:enabled = true
+plugin:seam:rounding = 12
+plugin:seam:seam_radius = 2
+plugin:seam:animate = true
+plugin:seam:animation_speed = 300
+plugin:seam:round_borders = true
+plugin:seam:round_shadows = true
+plugin:seam:force_round_risky_surfaces = true # needed for GPU-accelerated apps (Firefox-based browsers, etc.) whose content draws into a subsurface
+
+seamrule = rounding 4 4 22 22, class:^(kitty)$
+seamrule = seam 0, class:^(foot)$
+```
+
+The same thing in Hyprland's Lua config DSL:
+
+```lua
+hl.config({
+    plugin = {
+        seam = {
+            enabled = true,
+            rounding = 12,
+            seam_radius = 2,
+            animate = true,
+            animation_speed = 300,
+            round_borders = true,
+            round_shadows = true,
+            -- needed for GPU-accelerated apps (Firefox-based browsers, etc.)
+            -- whose content draws into a subsurface
+            force_round_risky_surfaces = true,
+        },
+    },
+})
+
+hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
+hl.plugin.seam.rule("seam 0, class:^(foot)$")
+```
+
+A fuller version of this file, with every option set to its default and
+commented, lives at [`examples/seam.conf`](examples/seam.conf); the Lua
+DSL equivalent is at [`examples/seam.lua`](examples/seam.lua).
+
 ### Global options
 
 All values live under the `plugin:seam:` prefix.
@@ -95,44 +141,6 @@ override, or else the four global `rounding_*` values. The seam flag
 resolves the same way, via `seamrule seam` or else `plugin:seam:enabled`.
 Floating windows always skip seam resolution and render with base
 rounding only.
-
-### Example
-
-A plain hyprlang `.conf` snippet covering the common options:
-
-```
-plugin:seam:enabled = true
-plugin:seam:rounding = 12
-plugin:seam:seam_radius = 2
-plugin:seam:animate = true
-plugin:seam:animation_speed = 300
-
-seamrule = rounding 4 4 22 22, class:^(kitty)$
-seamrule = seam 0, class:^(foot)$
-```
-
-The same thing in Hyprland's Lua config DSL:
-
-```lua
-hl.config({
-    plugin = {
-        seam = {
-            enabled = true,
-            rounding = 12,
-            seam_radius = 2,
-            animate = true,
-            animation_speed = 300,
-        },
-    },
-})
-
-hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
-hl.plugin.seam.rule("seam 0, class:^(foot)$")
-```
-
-A fuller version of this file, with every option set to its default and
-commented, lives at [`examples/seam.conf`](examples/seam.conf); the Lua
-DSL equivalent is at [`examples/seam.lua`](examples/seam.lua).
 
 ### Per-app rules (`seamrule`)
 
