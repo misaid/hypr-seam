@@ -17,8 +17,23 @@
 //
 // This works because g_pHyprRenderer->m_renderData.damage is what restricts drawing;
 // drawSurface never reads its `damage` parameter (checked in source and by testing). It
-// doesn't work when m_renderData.clipBox is set, for example on a floating window during
-// a slide animation. For that frame the window is drawn natively with square corners.
+// doesn't work when m_renderData.clipBox is set — Hyprland sets this itself
+// (Renderer.cpp, renderWindow) for any floating, non-fullscreen, non-pinned window while
+// its workspace's slide animation is running, clipping the draw to the window's own full
+// bounding box. renderTextureInternal then clips every rect to clipBox∩clipRegion and
+// ignores damage entirely, and a single CBox can't express "window minus 4 corner
+// squares", so the per-corner damage-pruning trick above can't run for that window's
+// whole slide duration.
+//
+// When all 4 live corners currently want the same radius (the common case: no adjacency
+// flattening one of them), there's a second, region-free lever that still works under
+// clipBox: element->m_data.rounding/roundingPower, which drawSurface's own rounded-rect
+// shader reads directly and applies to all 4 corners, the same as a native
+// `decoration:rounding` window. Setting that for the one call below covers the ordinary
+// floating-window-during-workspace-switch case. Only the rarer case — 4 different radii
+// *and* mid-slide at once — still falls back to a native, square-cornered draw for that
+// frame, since a single radius can't reproduce 4 different ones.
+//
 // Surfaces Hyprland marks dontRound (internal fullscreen) are also drawn natively.
 //
 // Subsurfaces are drawn natively by default too, which is why Firefox-based browsers
@@ -311,16 +326,6 @@ namespace {
 
         auto& renderData = g_pHyprRenderer->m_renderData;
 
-        // preDrawSurface has already copied element->m_data.clipBox into
-        // g_pHyprRenderer->m_renderData.clipBox. When it's set (for example, a floating window
-        // during a workspace slide), renderTextureInternal ignores damage and clips to
-        // clipBox∩clipRegion. A single CBox can't express "window minus 4 corner squares", so
-        // draw natively, with square corners, for that frame.
-        if (!renderData.clipBox.empty()) {
-            callOriginal();
-            return;
-        }
-
         // The same windowBox drawSurface computes. getTexBox() is cached on the element after
         // its first call in a frame, so this call and the body draw see the same box.
         CBox windowBox = el->getTexBox();
@@ -343,6 +348,41 @@ namespace {
         static auto  PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float  roundingPower = *PPOWER;
         const double scale         = data.pMonitor->m_scale;
+
+        // preDrawSurface has already copied element->m_data.clipBox into
+        // g_pHyprRenderer->m_renderData.clipBox (see the file-level comment above for why
+        // that blocks the damage-pruning trick below). If all 4 corners want the same
+        // radius, fall back to Hyprland's own single-radius rounding for this one call —
+        // it's driven by element->m_data.rounding/roundingPower, not damage or clipBox, so
+        // it still renders correctly. Otherwise, keep the native square draw.
+        if (!renderData.clipBox.empty()) {
+            constexpr double kEqualEpsilon = 0.01; // logical px; animated corners can differ by sub-pixel noise
+            const bool        uniform      = std::abs(radii.topLeft - radii.topRight) < kEqualEpsilon &&
+                std::abs(radii.topLeft - radii.bottomLeft) < kEqualEpsilon && std::abs(radii.topLeft - radii.bottomRight) < kEqualEpsilon;
+
+            if (uniform) {
+                const int round = makeCornerPatch(windowBox, true, true, radii.topLeft, scale).round;
+                if (round > 0) {
+                    const int   savedRounding = data.rounding;
+                    const float savedPower    = data.roundingPower;
+
+                    // +1 compensates for drawSurface's own `rounding -= 1` ("to fix a
+                    // border issue"), so the shader ends up with the same radius our
+                    // corner patches would have used.
+                    data.rounding      = round + 1;
+                    data.roundingPower = roundingPower;
+
+                    callOriginal();
+
+                    data.rounding      = savedRounding;
+                    data.roundingPower = savedPower;
+                    return;
+                }
+            }
+
+            callOriginal();
+            return;
+        }
 
         const SCornerPatches patches = computeCornerPatches(windowBox, radii, scale);
 
