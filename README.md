@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/b4e92a3d-2223-406b-b80d-d5382d2eec14
 
 ## Requirements
 
-- Hyprland, built and tested against the 0.56.2 internal ABI. The plugin
+- Hyprland, built and tested against the 0.57.0 internal ABI. The plugin
   hooks an internal, version-unstable function (`createFunctionHook`, also
   used by plugins like `hy3`), so a Hyprland update that changes that
   function's signature needs a matching plugin update.
