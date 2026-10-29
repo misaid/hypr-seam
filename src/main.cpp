@@ -6,7 +6,8 @@
 #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/config/lua/ConfigManager.hpp>
@@ -198,7 +199,7 @@ namespace {
     int luaSeamDebugState(lua_State* L) {
         {
             const auto dump = SeamState::debugDump();
-            Log::logger->log(Log::INFO, "[hypr-seam debugstate]\n{}", dump);
+            Log::logger->log(Log::INFO, "hypr-seam", "[hypr-seam debugstate]\n{}", dump);
             lua_pushstring(L, dump.c_str());
         }
         return 1;
@@ -377,7 +378,7 @@ static void attachExistingWindows() {
 static void registerDebugDispatcher() {
     HyprlandAPI::addDispatcherV2(PHANDLE, "seam:debugstate", [](std::string) -> SDispatchResult {
         const auto dump = SeamState::debugDump();
-        Log::logger->log(Log::INFO, "[hypr-seam debugstate]\n{}", dump);
+        Log::logger->log(Log::INFO, "hypr-seam", "[hypr-seam debugstate]\n{}", dump);
         HyprlandAPI::addNotification(PHANDLE, "[hypr-seam debug]\n" + dump, CHyprColor{0.4, 0.7, 1.0, 1.0}, kNotifyTimeoutMs);
         return {};
     });

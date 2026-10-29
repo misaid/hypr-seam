@@ -49,11 +49,13 @@
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/plugins/HookSystem.hpp>
+#include <hyprland/src/render/Context.hpp>
 #include <hyprland/src/render/ElementRenderer.hpp>
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/desktop/view/types/GeometricMovableAnimated.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
@@ -72,28 +74,30 @@
 namespace {
     CFunctionHook* g_hook = nullptr;
 
-    // From /usr/include/hyprland/src/render/ElementRenderer.hpp (Hyprland 0.56.2):
-    //   void Render::IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegion& damage);
+    // From /usr/include/hyprland/src/render/ElementRenderer.hpp (Hyprland 0.57.0):
+    //   void Render::IElementRenderer::drawSurface(Render::CRenderContext& ctx, WP<CSurfacePassElement> element, const CRegion& damage);
     // It's a private, non-virtual member. Under the Itanium C++ ABI, a non-virtual member
     // is called like a free function with the object pointer as the first argument, so
     // `this` is an explicit leading void* here. WP<> isn't trivially copyable, so both the
     // original and the replacement take it by invisible reference; declaring the same C++
     // parameter types gives both sides the same ABI.
-    using drawSurface_t = void (*)(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage);
+    using drawSurface_t = void (*)(void* thisptr, Render::CRenderContext& ctx, WP<CSurfacePassElement> element, const CRegion& damage);
 
-    constexpr const char* TARGET_DEMANGLED = "Render::IElementRenderer::drawSurface(Hyprutils::Memory::CWeakPointer<CSurfacePassElement>, Hyprutils::Math::CRegion const&)";
+    constexpr const char* TARGET_DEMANGLED =
+        "Render::IElementRenderer::drawSurface(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<CSurfacePassElement>, Hyprutils::Math::CRegion const&)";
 
-    // Per ElementRenderer.hpp (0.56.2) and `nm -DC /usr/bin/Hyprland`, calculateUVForSurface
+    // Per ElementRenderer.hpp (0.57.0) and `nm -DC /usr/bin/Hyprland`, calculateUVForSurface
     // is a private, non-virtual member of IElementRenderer whose symbol is exported.
     // findFunctionsByName can find it, and it's called with the same leading-`this`
     // convention as drawSurface. SP<> arguments aren't trivially copyable, so they go by
     // invisible reference; the same C++ parameter types give a matching ABI.
-    using calculateUV_t = void (*)(void* thisptr, PHLWINDOW, SP<CWLSurfaceResource>, PHLMONITOR, bool main, const Vector2D& projSize, const Vector2D& projSizeUnscaled,
-                                   bool fixMisalignedFSV1);
+    using calculateUV_t = void (*)(void* thisptr, Render::CRenderContext& ctx, PHLWINDOW, SP<CWLSurfaceResource>, PHLMONITOR, bool main, const Vector2D& projSize,
+                                   const Vector2D& projSizeUnscaled, bool fixMisalignedFSV1);
 
     constexpr const char* CALCUV_DEMANGLED =
-        "Render::IElementRenderer::calculateUVForSurface(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, "
-        "Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, bool, Hyprutils::Math::Vector2D const&, Hyprutils::Math::Vector2D const&, bool)";
+        "Render::IElementRenderer::calculateUVForSurface(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, "
+        "Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, bool, Hyprutils::Math::Vector2D const&, "
+        "Hyprutils::Math::Vector2D const&, bool)";
 
     calculateUV_t g_calculateUV = nullptr;
 
@@ -169,8 +173,8 @@ namespace {
     // Redraws each corner with its own live radius, limited to that corner's box (intersected
     // with this frame's damage). Calling Hyprland's rounded-rect shader once per corner is
     // what gives each corner its own radius.
-    void drawCorners(const SCornerPatches& patches, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const CRegion& savedDamage,
-                      const SUVMapping& uv, float roundingPower) {
+    void drawCorners(Render::CRenderContext& ctx, const SCornerPatches& patches, const CSurfacePassElement::SRenderData& data, const CBox& windowBox,
+                      const CRegion& savedDamage, const SUVMapping& uv, float roundingPower) {
         auto        PSURFACE = Desktop::View::CWLSurface::fromResource(data.surface);
         const float ALPHA    = data.alpha * data.fadeAlpha * (PSURFACE ? PSURFACE->m_alphaModifier : 1.F);
         const float OVERALLA = PSURFACE ? PSURFACE->m_overallOpacity : 1.F;
@@ -183,7 +187,7 @@ namespace {
             if (cornerRegion.empty())
                 return;
 
-            Render::GL::g_pHyprOpenGL->renderTexture(data.texture, windowBox,
+            Render::GL::g_pHyprOpenGL->renderTexture(ctx, data.texture, windowBox,
                                                       Render::GL::CHyprOpenGLImpl::STextureRenderData{
                                                           .damage        = &cornerRegion,
                                                           .surface       = data.surface,
@@ -264,21 +268,20 @@ namespace {
     // (viewporter source crops, expand_undersized_textures, the resize/animation RATIO crop,
     // fractional-scale misalignment), so the corners sample the same texels as the body next
     // to them, even while the buffer size lags the animated box.
-    SUVMapping recomputeUV(void* thisptr, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const Vector2D& projSizeUnscaled,
-                           Render::SRenderData& renderData) {
-        (*g_calculateUV)(thisptr, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled,
+    SUVMapping recomputeUV(void* thisptr, Render::CRenderContext& ctx, const CSurfacePassElement::SRenderData& data, const CBox& windowBox, const Vector2D& projSizeUnscaled) {
+        (*g_calculateUV)(thisptr, ctx, data.pWindow, data.surface, data.pMonitor.lock(), data.mainSurface, windowBox.size(), projSizeUnscaled,
                           misalignedFSv1(data, windowBox));
-        const SUVMapping uv{renderData.primarySurfaceUVTopLeft, renderData.primarySurfaceUVBottomRight};
-        renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
-        renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+        const SUVMapping uv{ctx.m_data.primarySurfaceUVTopLeft, ctx.m_data.primarySurfaceUVBottomRight};
+        ctx.m_data.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+        ctx.m_data.primarySurfaceUVBottomRight = Vector2D(-1, -1);
         return uv;
     }
 
-    void hkDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
+    void hkDrawSurface(void* thisptr, Render::CRenderContext& ctx, WP<CSurfacePassElement> element, const CRegion& damage) {
         // Never .lock() this WP. It points at a UP<>-owned render-pass element, and
         // WP::lock() asserts on a CUniquePointer. Use expired()/get(), and don't keep the
         // raw pointer past this call.
-        const auto callOriginal = [&]() { (*reinterpret_cast<drawSurface_t>(g_hook->m_original))(thisptr, element, damage); };
+        const auto callOriginal = [&]() { (*reinterpret_cast<drawSurface_t>(g_hook->m_original))(thisptr, ctx, element, damage); };
 
         if (element.expired()) {
             callOriginal();
@@ -324,7 +327,7 @@ namespace {
             return;
         }
 
-        auto& renderData = g_pHyprRenderer->m_renderData;
+        auto& renderData = ctx.m_data;
 
         // The same windowBox drawSurface computes. getTexBox() is cached on the element after
         // its first call in a frame, so this call and the body draw see the same box.
@@ -403,9 +406,9 @@ namespace {
         data.dontRound    = savedDontRound;
 
         const Vector2D   projSizeUnscaled = el->getTexBox().size();
-        const SUVMapping uv               = recomputeUV(thisptr, data, windowBox, projSizeUnscaled, renderData);
+        const SUVMapping uv               = recomputeUV(thisptr, ctx, data, windowBox, projSizeUnscaled);
 
-        drawCorners(patches, data, windowBox, savedDamage, uv, roundingPower);
+        drawCorners(ctx, patches, data, windowBox, savedDamage, uv, roundingPower);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -429,14 +432,14 @@ namespace {
     // hkDrawSurface leaves are never repainted and show black or stale content. Subtracting
     // each live corner's box from the region gets the backdrop under the corners drawn again.
     // A smaller opaque region only causes extra drawing underneath, so it's always safe.
-    using opaqueRegion_t = CRegion (*)(void* thisptr);
+    using opaqueRegion_t = CRegion (*)(void* thisptr, Render::CRenderContext& ctx);
 
-    constexpr const char* OPAQUE_DEMANGLED = "CSurfacePassElement::opaqueRegion()";
+    constexpr const char* OPAQUE_DEMANGLED = "CSurfacePassElement::opaqueRegion(Render::CRenderContext&)";
 
     CFunctionHook* g_opaqueHook = nullptr;
 
-    CRegion hkOpaqueRegion(void* thisptr) {
-        CRegion region = (*reinterpret_cast<opaqueRegion_t>(g_opaqueHook->m_original))(thisptr);
+    CRegion hkOpaqueRegion(void* thisptr, Render::CRenderContext& ctx) {
+        CRegion region = (*reinterpret_cast<opaqueRegion_t>(g_opaqueHook->m_original))(thisptr, ctx);
         if (region.empty())
             return region;
 
@@ -510,7 +513,7 @@ namespace {
     SLookupResult findExact(const std::string& shortName, const char* demangled) {
         void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
-            Log::logger->log(Log::DEBUG, "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
+            Log::logger->log(Log::DEBUG, "hypr-seam", "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
             if (m.demangled != demangled)
                 continue;
             if (found)
@@ -527,7 +530,7 @@ namespace {
         const std::string msg = result == eLookup::Ambiguous ?
             std::format("[hypr-seam] Found more than one exact match for {} — refusing to guess which to use. Rendering will not work.", what) :
             std::format("[hypr-seam] Could not locate {} to hook — rendering will not work.", what);
-        Log::logger->log(Log::ERR, "{}", msg);
+        Log::logger->log(Log::ERR, msg);
         HyprlandAPI::addNotification(PHANDLE, msg, kErrorColor, kNotifyTimeoutMs);
         return true;
     }
@@ -557,7 +560,7 @@ bool SeamHook::install() {
         return false;
     }
 
-    Log::logger->log(Log::DEBUG, "[hypr-seam] drawSurface hook installed @ {}", target);
+    Log::logger->log(Log::DEBUG, "hypr-seam", "[hypr-seam] drawSurface hook installed @ {}", target);
 
     // opaqueRegion hook (black/stale corner fix). If it can't be installed, corners still
     // render but may show black or stale content behind opaque windows, so warn and keep
@@ -567,7 +570,7 @@ bool SeamHook::install() {
     if (opaqueLookup.status != eLookup::Found) {
         const std::string msg = opaqueLookup.status == eLookup::Ambiguous ? "[hypr-seam] Found more than one exact match for CSurfacePassElement::opaqueRegion — not hooking it; corners may show black/stale content." :
                                                                              "[hypr-seam] Could not locate CSurfacePassElement::opaqueRegion — corners may show black/stale content.";
-        Log::logger->log(Log::ERR, "{}", msg);
+        Log::logger->log(Log::ERR, msg);
         HyprlandAPI::addNotification(PHANDLE, msg, kWarnColor, kNotifyTimeoutMs);
         return true;
     }
@@ -582,7 +585,7 @@ bool SeamHook::install() {
         return true;
     }
 
-    Log::logger->log(Log::DEBUG, "[hypr-seam] opaqueRegion hook installed @ {}", opaqueTarget);
+    Log::logger->log(Log::DEBUG, "hypr-seam", "[hypr-seam] opaqueRegion hook installed @ {}", opaqueTarget);
     return true;
 }
 

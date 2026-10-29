@@ -7,10 +7,11 @@
 
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/animation/AnimationManager.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 
@@ -105,7 +106,7 @@ void retarget(PHLANIMVAR<float>& anim, double target) {
 //
 // `w->isHidden()` reads m_hidden, which is group visibility (a window hidden in a
 // collapsed group). A window on an inactive workspace keeps its monitor-space
-// coordinates and passes that check, so `w->m_workspace->isVisible()` is checked
+// coordinates and passes that check, so `w->m_workspace->visible()` is checked
 // too. Without it, a window on workspace 2 could be flattened against one on
 // workspace 1 because their coordinates overlap.
 //
@@ -120,7 +121,7 @@ void retarget(PHLANIMVAR<float>& anim, double target) {
 // `geomType` picks GEOMETRIC_CURRENT (the live, animated position) or
 // GEOMETRIC_GOAL (the animation target). recomputeAll() and onTick() both use
 // GOAL; see recomputeAll().
-void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>& windows, std::vector<const CWorkspace*>& workspaces,
+void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>& windows, std::vector<const Workspace::CHLWorkspace*>& workspaces,
                            Desktop::View::IGeometric::eGeometricValueType geomType = Desktop::View::IGeometric::GEOMETRIC_CURRENT) {
     using Desktop::View::IGeometric;
 
@@ -128,10 +129,10 @@ void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>&
         if (!validMapped(w) || w->isHidden())
             continue;
 
-        if (!w->m_workspace || !w->m_workspace->isVisible())
+        if (!w->m_workspace || !w->m_workspace->visible())
             continue;
 
-        if (!w->m_isFloating) {
+        if (!w->isFloating()) {
             const auto FSWINDOW = Fullscreen::controller()->getFullscreenWindow(w->m_workspace);
             if (FSWINDOW && FSWINDOW != w)
                 continue; // tiled window covered by this workspace's fullscreen/maximized window
@@ -143,13 +144,13 @@ void collectVisibleWindows(std::vector<SSeamBox>& boxes, std::vector<PHLWINDOW>&
 
         windows.push_back(w);
         workspaces.push_back(w->m_workspace.get());
-        boxes.push_back(SSeamBox{pos.x, pos.y, size.x, size.y, w->m_isFloating, id});
+        boxes.push_back(SSeamBox{pos.x, pos.y, size.x, size.y, w->isFloating(), id});
     }
 }
 
 // Cheap hash of everything that affects adjacency, so onTick() can skip the
 // O(n^2) recompute on ticks where nothing moved.
-std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const std::vector<const CWorkspace*>& workspaces) {
+std::size_t fingerprintVisibleWindows(const std::vector<SSeamBox>& boxes, const std::vector<const Workspace::CHLWorkspace*>& workspaces) {
     std::size_t hash = boxes.size();
     auto        mix  = [&hash](std::size_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL /* splitmix64-style mix constant */ + (hash << 6) + (hash >> 2); };
     for (size_t i = 0; i < boxes.size(); ++i) {
@@ -281,14 +282,14 @@ static void recompute(const PHLWINDOW& only) {
     // layout no matter when the recompute fires.
     std::vector<SSeamBox>           boxes;
     std::vector<PHLWINDOW>          windows;
-    std::vector<const CWorkspace*> workspaces;
+    std::vector<const Workspace::CHLWorkspace*> workspaces;
     collectVisibleWindows(boxes, windows, workspaces, Desktop::View::IGeometric::GEOMETRIC_GOAL);
 
     // Adjacency is judged only between windows on the same workspace, and so the
     // same monitor. Otherwise a screen-edge corner can land within tolerance of a
     // window on the next monitor (only gaps_out away) or on a special workspace
     // shown on top, and get flattened.
-    std::unordered_map<const CWorkspace*, std::vector<SSeamBox>> pools;
+    std::unordered_map<const Workspace::CHLWorkspace*, std::vector<SSeamBox>> pools;
     for (size_t i = 0; i < boxes.size(); ++i)
         pools[workspaces[i]].push_back(boxes[i]);
 
@@ -304,7 +305,7 @@ static void recompute(const PHLWINDOW& only) {
         auto&       entry      = it->second;
         const auto& subjectBox = boxes[i];
 
-        auto resolved = resolveWindowConfig(w->m_class, w->m_title, w->m_isFloating, defaults, SeamRuleStore::rules());
+        auto resolved = resolveWindowConfig(w->metadata().appID(), w->metadata().title(), w->isFloating(), defaults, SeamRuleStore::rules());
 
         if (!resolved.seamEnabled)
             retargetDisabled(entry, resolved, subjectBox);
@@ -327,7 +328,7 @@ void SeamState::onTick() {
     // allocating each time would cost something even when nothing changed.
     static std::vector<SSeamBox>           boxes;
     static std::vector<PHLWINDOW>          windows;
-    static std::vector<const CWorkspace*> workspaces;
+    static std::vector<const Workspace::CHLWorkspace*> workspaces;
     boxes.clear();
     windows.clear();
     workspaces.clear();
@@ -355,7 +356,7 @@ std::string SeamState::debugDump() {
     std::ostringstream out;
     out << g_entries.size() << " tracked window(s)\n";
     for (auto& [w, entry] : g_entries) {
-        out << "- " << (w ? w->m_class : std::string{"<null>"}) << " [" << (w ? w->m_title.substr(0, 32) : std::string{}) << "]";
+        out << "- " << (w ? w->metadata().appID() : std::string{"<null>"}) << " [" << (w ? w->metadata().title().substr(0, 32) : std::string{}) << "]";
         if (w) {
             const auto pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL);
             const auto size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL);

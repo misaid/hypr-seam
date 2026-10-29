@@ -36,10 +36,14 @@
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/plugins/HookSystem.hpp>
+#include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
+#include <hyprland/src/render/Context.hpp>
+#include <hyprland/src/render/WindowRenderPresentation.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
 #include <hyprland/src/render/pass/ShadowPassElement.hpp>
 #include <hyprland/src/render/decorations/CHyprDropShadowDecoration.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
@@ -82,8 +86,8 @@ namespace {
     // damage. `draw` makes the render call for one corner. Like hkDrawSurface, it reads
     // g_pHyprRenderer->m_renderData through `auto&` instead of naming its type.
     template <std::invocable<const SCornerBox&> F>
-    void forEachCorner(const SCornerBoxes& boxes, const CRegion& savedDamage, F&& draw) {
-        auto& renderData = g_pHyprRenderer->m_renderData;
+    void forEachCorner(Render::CRenderContext& ctx, const SCornerBoxes& boxes, const CRegion& savedDamage, F&& draw) {
+        auto& renderData = ctx.m_data;
         auto  redraw      = [&](const SCornerBox& patch) {
             if (patch.round <= 0)
                 return;
@@ -104,11 +108,11 @@ namespace {
 namespace {
     CFunctionHook* g_borderHook = nullptr;
 
-    using borderDraw_t = void (*)(void* thisptr, WP<CBorderPassElement> element, const CRegion& damage);
+    using borderDraw_t = void (*)(void* thisptr, Render::CRenderContext& ctx, WP<CBorderPassElement> element, const CRegion& damage);
 
-    // From the installed 0.56.2 headers and the dynamic symbol table.
+    // From the installed 0.57.0 headers and the dynamic symbol table.
     constexpr const char* BORDER_DEMANGLED =
-        "Render::GL::CGLElementRenderer::draw(Hyprutils::Memory::CWeakPointer<CBorderPassElement>, Hyprutils::Math::CRegion const&)";
+        "Render::GL::CGLElementRenderer::draw(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<CBorderPassElement>, Hyprutils::Math::CRegion const&)";
 
     bool roundBordersEnabled() {
         return vars.roundBorders && vars.roundBorders->value();
@@ -140,8 +144,8 @@ namespace {
         };
     }
 
-    void hkBorderDraw(void* thisptr, WP<CBorderPassElement> element, const CRegion& damage) {
-        const auto callOriginal = [&]() { (*reinterpret_cast<borderDraw_t>(g_borderHook->m_original))(thisptr, element, damage); };
+    void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, WP<CBorderPassElement> element, const CRegion& damage) {
+        const auto callOriginal = [&]() { (*reinterpret_cast<borderDraw_t>(g_borderHook->m_original))(thisptr, ctx, element, damage); };
 
         if (!roundBordersEnabled() || element.expired()) {
             callOriginal();
@@ -161,7 +165,7 @@ namespace {
             return;
         }
 
-        const PHLMONITOR mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        const PHLMONITOR mon = ctx.m_data.pMonitor.lock();
         if (!mon) {
             callOriginal();
             return;
@@ -177,7 +181,7 @@ namespace {
 
         const SCornerBoxes boxes = computeBorderCornerBoxes(data.box, *corners, scale, scaledBorderSize);
 
-        auto&         renderData  = g_pHyprRenderer->m_renderData;
+        auto&         renderData  = ctx.m_data;
         const CRegion savedDamage = renderData.damage;
         const int     savedRound  = data.round;
 
@@ -189,7 +193,7 @@ namespace {
         renderData.damage = savedDamage;
         data.round         = savedRound;
 
-        forEachCorner(boxes, savedDamage, [&](const SCornerBox& patch) {
+        forEachCorner(ctx, boxes, savedDamage, [&](const SCornerBox& patch) {
             const Render::GL::CHyprOpenGLImpl::SBorderRenderData perCorner{
                 .round         = patch.round,
                 .roundingPower = roundingPower,
@@ -198,17 +202,35 @@ namespace {
                 .outerRound    = -1, // use the same effective (round + borderSize) radius for the outer edge
             };
             if (data.hasGrad2)
-                Render::GL::g_pHyprOpenGL->renderBorder(data.box, data.grad1, data.grad2, data.lerp, perCorner);
+                Render::GL::g_pHyprOpenGL->renderBorder(ctx, data.box, data.grad1, data.grad2, data.lerp, perCorner);
             else
-                Render::GL::g_pHyprOpenGL->renderBorder(data.box, data.grad1, perCorner);
+                Render::GL::g_pHyprOpenGL->renderBorder(ctx, data.box, data.grad1, perCorner);
         });
     }
 } // namespace
 
 namespace {
-    CFunctionHook* g_shadowHook = nullptr;
+    CFunctionHook* g_shadowHook           = nullptr;
+    CFunctionHook* g_shadowTransitionHook = nullptr;
 
-    using shadowDraw_t = void (*)(void* thisptr, WP<CShadowPassElement> element, const CRegion& damage);
+    // 0.57 renders shadows through CHyprDropShadowDecoration::drawShadowInternal(), which
+    // receives the resolved gradient (and, during a colour fade, both gradients plus the
+    // lerp). Hooking those two exported overloads keeps the plugin out of the decoration's
+    // private gradient state while still getting the same colours the native draw uses.
+    using shadowDraw_t = void (*)(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                                  const Config::CGradientValueData& grad, float a, const Render::SWindowRenderPresentation& presentation);
+
+    using shadowDrawTransition_t = void (*)(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                                            const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                                            const Render::SWindowRenderPresentation& presentation);
+
+    constexpr const char* SHADOW_DEMANGLED =
+        "CHyprDropShadowDecoration::drawShadowInternal(Render::CRenderContext&, Hyprutils::Math::CBox const&, int, float, int, "
+        "Config::CGradientValueData const&, float, Render::SWindowRenderPresentation const&)";
+
+    constexpr const char* SHADOW_TRANSITION_DEMANGLED =
+        "CHyprDropShadowDecoration::drawShadowInternal(Render::CRenderContext&, Hyprutils::Math::CBox const&, int, float, int, "
+        "Config::CGradientValueData const&, Config::CGradientValueData const&, float, float, Render::SWindowRenderPresentation const&)";
 
     bool roundShadowsEnabled() {
         return vars.roundShadows && vars.roundShadows->value();
@@ -239,35 +261,24 @@ namespace {
         };
     }
 
-    void hkShadowDraw(void* thisptr, WP<CShadowPassElement> element, const CRegion& damage) {
-        const auto callOriginal = [&]() { (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, element, damage); };
-
-        if (!roundShadowsEnabled() || element.expired()) {
+    // Splits one shadow draw into the native straight edges (with the corner boxes pruned
+    // out of the damage) plus one redraw per rounded corner. `callOriginal` and `drawCorner`
+    // supply the overload-specific arguments.
+    template <typename CallOriginal, typename DrawCorner>
+    void drawShadowCorners(Render::CRenderContext& ctx, const CBox& fullBox, int range, CallOriginal&& callOriginal, DrawCorner&& drawCorner) {
+        if (!roundShadowsEnabled()) {
             callOriginal();
             return;
         }
 
-        auto& data = element.get()->m_data;
-        if (!data.deco) {
-            callOriginal();
-            return;
-        }
-
-        const PHLMONITOR mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        const PHLMONITOR mon = ctx.m_data.pMonitor.lock();
         if (!mon) {
             callOriginal();
             return;
         }
 
-        // getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow to the window that
-        // owns this shadow, so no separate window matching is needed.
-        const SShadowRenderData rd = data.deco->getRenderData(mon, data.a);
-        if (!rd.valid) {
-            callOriginal();
-            return;
-        }
-
-        const PHLWINDOW window = g_pHyprRenderer->m_renderData.currentWindow.lock();
+        // getRenderData() has already set currentWindow to the window that owns this shadow.
+        const PHLWINDOW window = ctx.m_data.currentWindow.lock();
         if (!window) {
             callOriginal();
             return;
@@ -287,42 +298,47 @@ namespace {
             return;
         }
 
-        // Use the window's live shadow color and fade state instead of the global config
-        // value. That covers color_inactive, per-window overrides and the focus-change fade.
-        const bool  animated = window->m_shadowFadeAnimationProgress->isBeingAnimated();
-        const auto& grad1    = animated ? window->m_realShadowColorPrevious : window->m_realShadowColor;
-        const auto& grad2    = window->m_realShadowColor;
-        const float lerp     = animated ? window->m_shadowFadeAnimationProgress->value() : 1.0F;
-
-        const int scaledRange = static_cast<int>(std::round(rd.size * mon->m_scale));
-
         static auto PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float roundingPower = *PPOWER;
 
-        const SCornerBoxes boxes = computeShadowCornerBoxes(rd.fullBox, *corners, mon->m_scale, scaledRange);
+        const SCornerBoxes boxes = computeShadowCornerBoxes(fullBox, *corners, mon->m_scale, range);
 
-        auto&         renderData  = g_pHyprRenderer->m_renderData;
+        auto&         renderData  = ctx.m_data;
         const CRegion savedDamage = renderData.damage;
 
         renderData.damage = pruneDamageForBoxes(savedDamage, boxes);
         callOriginal();
         renderData.damage = savedDamage;
 
-        // currentWindow is left unset for the corner redraws. The straight pass gets it from
-        // its own getRenderData() call inside callOriginal(). The shadow shader's window cutout
-        // (renderRoundedShadow in OpenGL.cpp, ~2412-2438, `cutoutRadius` from
-        // `PWINDOW->rounding() * scale`) is sized from the window's native rounding, which the
-        // plugin requires to be 0, so the cutout is always a hard square whatever `round` this
-        // call passes. On a rounded corner, that square cutout would leave a small triangular
-        // notch of background at the corner tip. Without the cutout, a translucent window's
-        // corner shadow shows through a small rounded sliver of its content as a soft tint,
-        // which is much less visible than the notch.
-        forEachCorner(boxes, savedDamage, [&](const SCornerBox& patch) {
-            if (animated)
-                Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, roundingPower, scaledRange, grad1, grad2, lerp, data.a);
-            else
-                Render::GL::g_pHyprOpenGL->renderRoundedShadow(rd.fullBox, patch.round, roundingPower, scaledRange, grad2, data.a);
-        });
+        // renderRoundedShadow's window cutout is sized from the window's native rounding,
+        // which the plugin requires to be 0, so the cutout is always a hard square whatever
+        // `round` these calls pass. On a rounded corner that leaves a small triangular notch
+        // of background at the tip; without a cutout, a translucent window instead shows a
+        // soft tint of its content through the corner. The tint is the less visible artifact.
+        forEachCorner(ctx, boxes, savedDamage, [&](const SCornerBox& patch) { drawCorner(patch, roundingPower); });
+    }
+
+    void hkShadowDraw(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range, const Config::CGradientValueData& grad,
+                      float a, const Render::SWindowRenderPresentation& presentation) {
+        drawShadowCorners(
+            ctx, box, range,
+            [&] { (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, ctx, box, round, roundingPower, range, grad, a, presentation); },
+            [&](const SCornerBox& patch, float power) {
+                Render::GL::g_pHyprOpenGL->renderRoundedShadow(ctx, box, patch.round, power, range, grad, a, presentation);
+            });
+    }
+
+    void hkShadowDrawTransition(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range, const Config::CGradientValueData& grad1,
+                                const Config::CGradientValueData& grad2, float lerp, float a, const Render::SWindowRenderPresentation& presentation) {
+        drawShadowCorners(
+            ctx, box, range,
+            [&] {
+                (*reinterpret_cast<shadowDrawTransition_t>(g_shadowTransitionHook->m_original))(thisptr, ctx, box, round, roundingPower, range, grad1, grad2, lerp, a,
+                                                                                               presentation);
+            },
+            [&](const SCornerBox& patch, float power) {
+                Render::GL::g_pHyprOpenGL->renderRoundedShadow(ctx, box, patch.round, power, range, grad1, grad2, lerp, a, presentation);
+            });
     }
 } // namespace
 
@@ -346,7 +362,7 @@ namespace {
     SLookupResult findExact(const std::string& shortName, const char* demangled) {
         void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
-            Log::logger->log(Log::DEBUG, "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
+            Log::logger->log(Log::DEBUG, "hypr-seam", "[hypr-seam] {} candidate: {} @ {}", shortName, m.demangled, m.address);
             if (m.demangled != demangled)
                 continue;
             if (found)
@@ -363,13 +379,11 @@ namespace {
         const std::string msg = result == eLookup::Ambiguous ?
             std::format("[hypr-seam] Found more than one exact match for {} — refusing to guess which to use.", what) :
             std::format("[hypr-seam] Could not locate {} to hook.", what);
-        Log::logger->log(Log::ERR, "{}", msg);
+        Log::logger->log(Log::ERR, msg);
         HyprlandAPI::addNotification(PHANDLE, msg, kErrorColor, kNotifyTimeoutMs);
         return true;
     }
 
-    constexpr const char* SHADOW_DEMANGLED =
-        "Render::GL::CGLElementRenderer::draw(Hyprutils::Memory::CWeakPointer<CShadowPassElement>, Hyprutils::Math::CRegion const&)";
 } // namespace
 
 bool SeamDecorHook::install() {
@@ -386,21 +400,32 @@ bool SeamDecorHook::install() {
         return false;
     }
 
-    const auto shadowLookup = findExact("draw", SHADOW_DEMANGLED);
-    if (reportLookupFailure(shadowLookup.status, "CGLElementRenderer::draw(CShadowPassElement)"))
-        return true; // border still installed; shadow rounding just won't work
+    // Shadow rounding hooks both drawShadowInternal overloads. A missing one only costs
+    // shadow rounding (a colour fade uses the transition overload), so warn and keep the
+    // border hook instead of failing the whole feature.
+    const auto installShadow = [&](const char* demangled, const char* what, void* replacement, CFunctionHook*& hook) {
+        const auto lookup = findExact("drawShadowInternal", demangled);
+        if (reportLookupFailure(lookup.status, what))
+            return;
+        hook = HyprlandAPI::createFunctionHook(PHANDLE, lookup.address, replacement);
+        if (!hook || !hook->hook()) {
+            Log::logger->log(Log::ERR, "[hypr-seam] failed to install shadow hook");
+            if (hook)
+                HyprlandAPI::removeFunctionHook(PHANDLE, hook);
+            hook = nullptr;
+        }
+    };
 
-    g_shadowHook = HyprlandAPI::createFunctionHook(PHANDLE, shadowLookup.address, reinterpret_cast<void*>(&hkShadowDraw));
-    if (!g_shadowHook || !g_shadowHook->hook()) {
-        Log::logger->log(Log::ERR, "[hypr-seam] failed to install shadow hook");
-        if (g_shadowHook)
-            HyprlandAPI::removeFunctionHook(PHANDLE, g_shadowHook);
-        g_shadowHook = nullptr;
-    }
+    installShadow(SHADOW_DEMANGLED, "CHyprDropShadowDecoration::drawShadowInternal (solid)", reinterpret_cast<void*>(&hkShadowDraw), g_shadowHook);
+    installShadow(SHADOW_TRANSITION_DEMANGLED, "CHyprDropShadowDecoration::drawShadowInternal (transition)", reinterpret_cast<void*>(&hkShadowDrawTransition),
+                  g_shadowTransitionHook);
     return true;
 }
 
 void SeamDecorHook::remove() {
+    if (g_shadowTransitionHook)
+        HyprlandAPI::removeFunctionHook(PHANDLE, g_shadowTransitionHook);
+    g_shadowTransitionHook = nullptr;
     if (g_shadowHook)
         HyprlandAPI::removeFunctionHook(PHANDLE, g_shadowHook);
     g_shadowHook = nullptr;
