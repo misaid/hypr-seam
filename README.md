@@ -206,3 +206,14 @@ mistakes.
   `hyprctl reload` applies them immediately. Lua configs aren't affected:
   `hl.config` changes through `hyprctl eval` apply at once. Hyprland
   removes `.conf` support in 0.57.
+- With `plugin:seam:round_shadows = true`, a small wedge of background
+  shows through at the tip of each rounded corner, inside the shadow's
+  blur range. Hyprland's shadow cutout (the hole the window sits in) is
+  sized from the window's native rounding, which this plugin forces to
+  0, so the cutout stays square no matter what radius the corner itself
+  uses. Removing the cutout closes the wedge but lets window content
+  leak through the corner instead, visible as a dark square on
+  GPU-accelerated clients like Ghostty and Zen Browser, so hypr-seam
+  doesn't do that. A real fix needs the cutout to use hypr-seam's live
+  per-corner radius, which means patching Hyprland's own
+  `renderRoundedShadow`; nothing reachable from plugin code controls it.
