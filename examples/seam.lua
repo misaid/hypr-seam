@@ -59,8 +59,8 @@ hl.config({
             animation_speed = 300,
 
             -- Name of a bezier curve already registered via hl.curve(...)
-            -- (or a `bezier =` line in a plain .conf config) to drive the
-            -- easing above. "default" is Hyprland's built-in curve.
+            -- to drive the easing above. "default" is Hyprland's built-in
+            -- curve.
             animation_curve = "default",
 
             -- Also round a window's subsurfaces where they reach the
@@ -87,8 +87,8 @@ hl.config({
 --
 -- Hyprland's plugin API has no hook into the native windowrulev2 engine, so
 -- hypr-seam parses its own rules using the same class:/title: match syntax
--- as windowrule2. hl.plugin.seam.rule(...) accepts either the exact string
--- a `seamrule = ...` config line would take, or an equivalent table.
+-- as windowrule2. hl.plugin.seam.rule(...) accepts either a rule string in
+-- that syntax, or an equivalent table.
 
 -- String form: opt a window out of the seam effect even if
 -- plugin:seam:enabled is true above.
