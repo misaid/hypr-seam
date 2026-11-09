@@ -1,34 +1,4 @@
-// Opt-in hooks that round border and shadow corners, using the same render-pass-element
-// pattern as hkDrawSurface in SeamHook.cpp. Each hook reads SeamState::liveCornersFor(window),
-// which already accounts for seams, animation and per-app rules, and redraws the border or
-// shadow in up to 4 corner passes through g_pHyprOpenGL->renderBorder()/renderRoundedShadow().
-// That's how hkDrawSurface gets per-corner rounding out of renderTexture()'s single `round`.
-//
-// Checked against the installed Hyprland 0.56.2 headers, the upstream 0.56.2 .cpp sources
-// (CHyprBorderDecoration.cpp, CHyprDropShadowDecoration.cpp, GLElementRenderer.cpp and
-// OpenGL.cpp, which the dev headers don't include), and the dynamic symbol table:
-//   - The exact demangled draw() overloads for CBorderPassElement/CShadowPassElement are below.
-//   - g_pHyprRenderer->m_renderData.damage limits renderBorder()/renderRoundedShadow() output
-//     the same way it limits drawSurface (tested with a pixel diff).
-//   - decoration:shadow:color resolves through CConfigValue<Config::IComplexConfigValue> to a
-//     Config::CGradientValueData.
-//   - CBorderPassElement::m_data.box and the fullBox from
-//     CHyprDropShadowDecoration::getRenderData() are both in monitor-scaled px rounded to int
-//     (both end with `.scale(pMonitor->m_scale).round()`), the same space as hkDrawSurface's
-//     windowBox. SeamState::liveCornersFor returns logical px, so both hooks multiply by the
-//     monitor scale before comparing.
-//   - renderBorder()'s effective inner radius is `data.round + (data.round == 0 ? 0 :
-//     scaledBorderSize)`. `data.outerRound == -1` reuses that value for the outer edge instead
-//     of native's whole-window outerRound, which gives one matching inner and outer curve for
-//     a single corner's radius.
-//   - renderBorder() draws into box.expand(scaledBorderSize), a ring that reaches
-//     scaledBorderSize past the content box on every side. A corner's redraw box has to reach
-//     that far out too, or the outer part of the ring stays square from the straight-edge pass.
-//   - getRenderData() sets g_pHyprRenderer->m_renderData.currentWindow as a side effect (the
-//     shadow shader uses it to cut the window's box out of the fill), and reposition() clears
-//     it at the end of the native render(). That makes it the shadow's owner: call
-//     getRenderData() once and read currentWindow, with no separate window matching. The
-//     corner redraws leave it unset on purpose; see hkShadowDraw.
+// Per-corner border and shadow rounding via render-pass elements.
 
 #include "SeamDecorHook.hpp"
 #include "SeamState.hpp"
@@ -44,6 +14,8 @@
 #include <hyprland/src/render/decorations/CHyprDropShadowDecoration.hpp>
 #include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
+#include <hyprland/src/desktop/rule/windowRule/WindowRuleApplicator.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
@@ -51,24 +23,44 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <concepts>
 #include <format>
 #include <string>
 
 namespace {
-    // One corner's redraw box, in the same monitor-scaled px space as the box it came from,
-    // plus the radius for that corner's shader call.
+    struct CRoundingOverride {
+        PHLWINDOW window;
+        bool had = false;
+        std::optional<Config::INTEGER> saved;
+        bool valid = false;
+        CRoundingOverride(PHLWINDOW w, Config::INTEGER v) {
+            if (!w || !w->m_ruleApplicator) return;
+            window = w;
+            auto& r = window->m_ruleApplicator->rounding();
+            had = r.hasValue() && r.getPriority() == Desktop::Types::PRIORITY_SET_PROP;
+            saved = had ? std::optional<Config::INTEGER>(r.value()) : std::nullopt;
+            r.set(v, Desktop::Types::PRIORITY_SET_PROP);
+            valid = true;
+        }
+        ~CRoundingOverride() {
+            if (!valid || !window || !window->m_ruleApplicator) return;
+            auto& r = window->m_ruleApplicator->rounding();
+            if (had) r.set(*saved, Desktop::Types::PRIORITY_SET_PROP);
+            else r.unset(Desktop::Types::PRIORITY_SET_PROP);
+        }
+        CRoundingOverride& operator=(const CRoundingOverride&) = delete;
+    };
+
     struct SCornerBox {
         CBox box;
-        int  round = 0; // 0 means "no rounding needed here, leave it to the native straight-edge paint"
+        int  round = 0; // 0 = no rounding
     };
 
     struct SCornerBoxes {
         SCornerBox topLeft, topRight, bottomLeft, bottomRight;
     };
 
-    // Subtracts each non-empty corner box from `savedDamage`, giving the region the
-    // straight-edge pass paints into.
     CRegion pruneDamageForBoxes(const CRegion& savedDamage, const SCornerBoxes& boxes) {
         CRegion pruned = savedDamage.copy();
         if (boxes.topLeft.round > 0)
@@ -82,9 +74,6 @@ namespace {
         return pruned;
     }
 
-    // Redraws each non-empty corner box, limited to that box intersected with this frame's
-    // damage. `draw` makes the render call for one corner. Like hkDrawSurface, it reads
-    // g_pHyprRenderer->m_renderData through `auto&` instead of naming its type.
     template <std::invocable<const SCornerBox&> F>
     void forEachCorner(Render::CRenderContext& ctx, const SCornerBoxes& boxes, const CRegion& savedDamage, F&& draw) {
         auto& renderData = ctx.m_data;
@@ -110,7 +99,6 @@ namespace {
 
     using borderDraw_t = void (*)(void* thisptr, Render::CRenderContext& ctx, WP<CBorderPassElement> element, const CRegion& damage);
 
-    // From the installed 0.57.0 headers and the dynamic symbol table.
     constexpr const char* BORDER_DEMANGLED =
         "Render::GL::CGLElementRenderer::draw(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<CBorderPassElement>, Hyprutils::Math::CRegion const&)";
 
@@ -118,15 +106,12 @@ namespace {
         return vars.roundBorders && vars.roundBorders->value();
     }
 
-    // Anchored on `box`, the border's content box before expansion, and extended by
-    // `scaledBorderSize` past the corner's two outer edges, so the redraw box covers the whole
-    // ring renderBorder() paints there (box.expand(scaledBorderSize)).
     SCornerBox makeBorderCornerBox(const CBox& box, bool left, bool top, double liveRadiusPx, double scale, int scaledBorderSize) {
         const double maxR  = std::floor(std::min(box.width, box.height) / 2.0);
         const double r     = std::clamp(liveRadiusPx * scale, 0.0, maxR);
         const int    round = static_cast<int>(std::lround(r));
         if (round <= 0)
-            return SCornerBox{}; // renderBorder's effective round is 0 here too, so the native paint is already right.
+            return SCornerBox{};
 
         const double innerSize = std::ceil(r);
         const double size      = innerSize + scaledBorderSize;
@@ -174,24 +159,104 @@ namespace {
         const double scale            = mon->m_scale;
         const int    scaledBorderSize = static_cast<int>(std::round(data.borderSize * scale));
 
-        // Same setting hkDrawSurface uses for content corners, not the native per-window
-        // roundingPower, so the border and shadow curve the same way as the content.
         static auto PPOWER       = CConfigValue<Config::FLOAT>("plugin:seam:rounding_power");
         const float roundingPower = *PPOWER;
 
         const SCornerBoxes boxes = computeBorderCornerBoxes(data.box, *corners, scale, scaledBorderSize);
 
+        {
+            const int r0 = boxes.topLeft.round;
+            if (r0 > 0 && boxes.topRight.round == r0 && boxes.bottomLeft.round == r0 && boxes.bottomRight.round == r0) {
+                const int savedRound = data.round;
+                const int savedOuterRound = data.outerRound;
+                const auto savedPower = data.roundingPower;
+                data.round = r0;
+                data.outerRound = -1;
+                data.roundingPower = roundingPower;
+                callOriginal();
+                data.round = savedRound;
+                data.outerRound = savedOuterRound;
+                data.roundingPower = savedPower;
+                return;
+            }
+        }
+
+        {
+            if (!ctx.m_data.clipBox.empty()) {
+                callOriginal();
+                return;
+            }
+        }
+
         auto&         renderData  = ctx.m_data;
         const CRegion savedDamage = renderData.damage;
         const int     savedRound  = data.round;
 
+        {
+            const int rounds[4] = {boxes.topLeft.round, boxes.topRight.round, boxes.bottomLeft.round, boxes.bottomRight.round};
+            int best = rounds[0];
+            for (int i = 1; i < 4; ++i)
+                best = std::max(best, rounds[i]);
+            bool allPositive = boxes.topLeft.round > 0 && boxes.topRight.round > 0 && boxes.bottomLeft.round > 0 && boxes.bottomRight.round > 0;
+            if (best > 0 && allPositive) {
+                SCornerBoxes diff = boxes;
+                auto rescaleB = [&](SCornerBox& pc, bool left, bool top) {
+                    if (pc.round == best) { pc.round = 0; return; }
+                    SCornerBox nb = makeBorderCornerBox(data.box, left, top, best / scale, scale, scaledBorderSize);
+                    nb.round = pc.round;
+                    pc = nb;
+                };
+                rescaleB(diff.topLeft, true, true);
+                rescaleB(diff.topRight, false, true);
+                rescaleB(diff.bottomLeft, true, false);
+                rescaleB(diff.bottomRight, false, false);
+
+                const int   savedOuterRound = data.outerRound;
+                const float savedPower      = data.roundingPower;
+
+                renderData.damage = pruneDamageForBoxes(savedDamage, diff);
+                data.round         = best;
+                data.outerRound    = -1;
+                data.roundingPower = roundingPower;
+
+                callOriginal();
+
+                renderData.damage = savedDamage;
+                data.round         = savedRound;
+                data.outerRound    = savedOuterRound;
+                data.roundingPower = savedPower;
+
+                forEachCorner(ctx, diff, savedDamage, [&](const SCornerBox& patch) {
+                    const Render::GL::CHyprOpenGLImpl::SBorderRenderData perCorner{
+                        .round         = patch.round,
+                        .roundingPower = roundingPower,
+                        .borderSize    = data.borderSize,
+                        .a             = data.a,
+                        .outerRound    = -1,
+                    };
+                    if (data.hasGrad2)
+                        Render::GL::g_pHyprOpenGL->renderBorder(ctx, data.box, data.grad1, data.grad2, data.lerp, perCorner);
+                    else
+                        Render::GL::g_pHyprOpenGL->renderBorder(ctx, data.box, data.grad1, perCorner);
+                });
+                return;
+            }
+        }
+
+        const int   savedOuterRound = data.outerRound;
+        const float savedPower      = data.roundingPower;
+
         renderData.damage = pruneDamageForBoxes(savedDamage, boxes);
         data.round         = 0;
+        data.outerRound    = -1;
+        data.roundingPower = roundingPower;
 
         callOriginal();
 
         renderData.damage = savedDamage;
         data.round         = savedRound;
+        data.outerRound    = savedOuterRound;
+        data.roundingPower = savedPower;
 
         forEachCorner(ctx, boxes, savedDamage, [&](const SCornerBox& patch) {
             const Render::GL::CHyprOpenGLImpl::SBorderRenderData perCorner{
@@ -213,10 +278,6 @@ namespace {
     CFunctionHook* g_shadowHook           = nullptr;
     CFunctionHook* g_shadowTransitionHook = nullptr;
 
-    // 0.57 renders shadows through CHyprDropShadowDecoration::drawShadowInternal(), which
-    // receives the resolved gradient (and, during a colour fade, both gradients plus the
-    // lerp). Hooking those two exported overloads keeps the plugin out of the decoration's
-    // private gradient state while still getting the same colours the native draw uses.
     using shadowDraw_t = void (*)(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
                                   const Config::CGradientValueData& grad, float a, const Render::SWindowRenderPresentation& presentation);
 
@@ -236,9 +297,6 @@ namespace {
         return vars.roundShadows && vars.roundShadows->value();
     }
 
-    // Anchored on `fullBox`'s corner. fullBox is already the outer extent: the window box plus
-    // the shadow range on every side. The box extends inward by the scaled shadow range, so it
-    // covers the corner's rounded falloff and the blur margin out to fullBox's edge.
     SCornerBox makeShadowCornerBox(const CBox& fullBox, bool left, bool top, double liveRadiusPx, double scale, int scaledRange) {
         const double maxR  = std::floor(std::min(fullBox.width, fullBox.height) / 2.0);
         const double r     = std::clamp(liveRadiusPx * scale, 0.0, maxR);
@@ -261,11 +319,9 @@ namespace {
         };
     }
 
-    // Splits one shadow draw into the native straight edges (with the corner boxes pruned
-    // out of the damage) plus one redraw per rounded corner. `callOriginal` and `drawCorner`
-    // supply the overload-specific arguments.
-    template <typename CallOriginal, typename DrawCorner>
-    void drawShadowCorners(Render::CRenderContext& ctx, const CBox& fullBox, int range, CallOriginal&& callOriginal, DrawCorner&& drawCorner) {
+    template <typename CallOriginal, typename CallOriginalWithRound, typename DrawCorner>
+    void drawShadowCorners(Render::CRenderContext& ctx, const CBox& fullBox, int range, CallOriginal&& callOriginal,
+                           CallOriginalWithRound&& callOriginalWithRound, DrawCorner&& drawCorner) {
         if (!roundShadowsEnabled()) {
             callOriginal();
             return;
@@ -277,7 +333,6 @@ namespace {
             return;
         }
 
-        // getRenderData() has already set currentWindow to the window that owns this shadow.
         const PHLWINDOW window = ctx.m_data.currentWindow.lock();
         if (!window) {
             callOriginal();
@@ -290,8 +345,6 @@ namespace {
             return;
         }
 
-        // decoration:shadow:sharp draws a flat rect without the rounded falloff this hook
-        // expects, so leave it to the native draw.
         static auto PSHADOWSHARP = CConfigValue<Config::INTEGER>("decoration:shadow:sharp");
         if (*PSHADOWSHARP) {
             callOriginal();
@@ -303,19 +356,85 @@ namespace {
 
         const SCornerBoxes boxes = computeShadowCornerBoxes(fullBox, *corners, mon->m_scale, range);
 
+        {
+            const int r0 = boxes.topLeft.round;
+            if (r0 > 0 && boxes.topRight.round == r0 && boxes.bottomLeft.round == r0 && boxes.bottomRight.round == r0) {
+                const double combinedScale = std::max(0.0001, sc<double>(ctx.m_data.renderModif.combinedScale()));
+                const double nativePower   = std::max(0.01, sc<double>(window->m_ruleApplicator->roundingPower().valueOrDefault()));
+                const auto   nativeRound   = static_cast<Config::INTEGER>(std::floor(r0 * 2.0 / (nativePower * mon->m_scale * combinedScale)));
+                CRoundingOverride override{window, nativeRound};
+
+                callOriginalWithRound(r0, roundingPower);
+                return;
+            }
+        }
+
+        {
+            if (!ctx.m_data.clipBox.empty()) {
+                callOriginal();
+                return;
+            }
+        }
+
         auto&         renderData  = ctx.m_data;
         const CRegion savedDamage = renderData.damage;
+
+        {
+            const int rounds[4] = {boxes.topLeft.round, boxes.topRight.round, boxes.bottomLeft.round, boxes.bottomRight.round};
+            int best = rounds[0];
+            for (int i = 1; i < 4; ++i)
+                best = std::max(best, rounds[i]);
+            bool allPositive = boxes.topLeft.round > 0 && boxes.topRight.round > 0 && boxes.bottomLeft.round > 0 && boxes.bottomRight.round > 0;
+            if (best > 0 && allPositive) {
+                SCornerBoxes diff = boxes;
+                auto rescaleS = [&](SCornerBox& pc, bool left, bool top) {
+                    if (pc.round == best) { pc.round = 0; return; }
+                    SCornerBox nb = makeShadowCornerBox(fullBox, left, top, best / mon->m_scale, mon->m_scale, range);
+                    nb.round = pc.round;
+                    pc = nb;
+                };
+                rescaleS(diff.topLeft, true, true);
+                rescaleS(diff.topRight, false, true);
+                rescaleS(diff.bottomLeft, true, false);
+                rescaleS(diff.bottomRight, false, false);
+
+                {
+                    const double combinedScale = std::max(0.0001, sc<double>(ctx.m_data.renderModif.combinedScale()));
+                    const double nativePower   = std::max(0.01, sc<double>(window->m_ruleApplicator->roundingPower().valueOrDefault()));
+                    const auto   nativeRound   = static_cast<Config::INTEGER>(std::floor(best * 2.0 / (nativePower * mon->m_scale * combinedScale)));
+                    CRoundingOverride override{window, nativeRound};
+
+                    renderData.damage = pruneDamageForBoxes(savedDamage, diff);
+                    callOriginalWithRound(best, roundingPower);
+                    renderData.damage = savedDamage;
+                }
+
+                forEachCorner(ctx, diff, savedDamage, [&](const SCornerBox& patch) {
+                    const double combinedScale = std::max(0.0001, sc<double>(ctx.m_data.renderModif.combinedScale()));
+                    const double nativePower   = std::max(0.01, sc<double>(window->m_ruleApplicator->roundingPower().valueOrDefault()));
+                    const int    cutoutRound   = std::max(0, patch.round - 2);
+                    const auto   nativeRound   = static_cast<Config::INTEGER>(std::floor(cutoutRound * 2.0 / (nativePower * mon->m_scale * combinedScale)));
+                    CRoundingOverride override{window, nativeRound};
+
+                    drawCorner(patch, roundingPower);
+                });
+                return;
+            }
+        }
 
         renderData.damage = pruneDamageForBoxes(savedDamage, boxes);
         callOriginal();
         renderData.damage = savedDamage;
 
-        // renderRoundedShadow's window cutout is sized from the window's native rounding,
-        // which the plugin requires to be 0, so the cutout is always a hard square whatever
-        // `round` these calls pass. On a rounded corner that leaves a small triangular notch
-        // of background at the tip; without a cutout, a translucent window instead shows a
-        // soft tint of its content through the corner. The tint is the less visible artifact.
-        forEachCorner(ctx, boxes, savedDamage, [&](const SCornerBox& patch) { drawCorner(patch, roundingPower); });
+        forEachCorner(ctx, boxes, savedDamage, [&](const SCornerBox& patch) {
+            const double combinedScale = std::max(0.0001, sc<double>(ctx.m_data.renderModif.combinedScale()));
+            const double nativePower   = std::max(0.01, sc<double>(window->m_ruleApplicator->roundingPower().valueOrDefault()));
+            const int    cutoutRound   = std::max(0, patch.round - 2);
+            const auto   nativeRound   = static_cast<Config::INTEGER>(std::floor(cutoutRound * 2.0 / (nativePower * mon->m_scale * combinedScale)));
+            CRoundingOverride override{window, nativeRound};
+
+            drawCorner(patch, roundingPower);
+        });
     }
 
     void hkShadowDraw(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range, const Config::CGradientValueData& grad,
@@ -323,6 +442,9 @@ namespace {
         drawShadowCorners(
             ctx, box, range,
             [&] { (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, ctx, box, round, roundingPower, range, grad, a, presentation); },
+            [&](int ro, float power) {
+                (*reinterpret_cast<shadowDraw_t>(g_shadowHook->m_original))(thisptr, ctx, box, ro, power, range, grad, a, presentation);
+            },
             [&](const SCornerBox& patch, float power) {
                 Render::GL::g_pHyprOpenGL->renderRoundedShadow(ctx, box, patch.round, power, range, grad, a, presentation);
             });
@@ -334,6 +456,10 @@ namespace {
             ctx, box, range,
             [&] {
                 (*reinterpret_cast<shadowDrawTransition_t>(g_shadowTransitionHook->m_original))(thisptr, ctx, box, round, roundingPower, range, grad1, grad2, lerp, a,
+                                                                                               presentation);
+            },
+            [&](int ro, float power) {
+                (*reinterpret_cast<shadowDrawTransition_t>(g_shadowTransitionHook->m_original))(thisptr, ctx, box, ro, power, range, grad1, grad2, lerp, a,
                                                                                                presentation);
             },
             [&](const SCornerBox& patch, float power) {
@@ -357,8 +483,6 @@ namespace {
         void*   address = nullptr;
     };
 
-    // Finds the one function whose demangled name equals `demangled`. Returns Ambiguous if
-    // there is more than one exact match. Same as SeamHook.cpp's findExact.
     SLookupResult findExact(const std::string& shortName, const char* demangled) {
         void* found = nullptr;
         for (const auto& m : HyprlandAPI::findFunctionsByName(PHANDLE, shortName)) {
@@ -400,9 +524,6 @@ bool SeamDecorHook::install() {
         return false;
     }
 
-    // Shadow rounding hooks both drawShadowInternal overloads. A missing one only costs
-    // shadow rounding (a colour fade uses the transition overload), so warn and keep the
-    // border hook instead of failing the whole feature.
     const auto installShadow = [&](const char* demangled, const char* what, void* replacement, CFunctionHook*& hook) {
         const auto lookup = findExact("drawShadowInternal", demangled);
         if (reportLookupFailure(lookup.status, what))

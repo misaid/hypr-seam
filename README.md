@@ -183,15 +183,7 @@ mistakes.
   `plugin:seam:round_shadows`) are off by default. They use the same
   per-corner re-render technique as window content, applied to Hyprland's
   own border and shadow passes. Until enabled, a window's border and
-  shadow stay native (square, if `decoration:rounding = 0`).
-- With `plugin:seam:round_shadows = true`, a small wedge of background
-  shows through at the tip of each rounded corner, inside the shadow's
-  blur range. Hyprland's shadow cutout (the hole the window sits in) is
-  sized from the window's native rounding, which this plugin forces to
-  0, so the cutout stays square no matter what radius the corner itself
-  uses. Removing the cutout closes the wedge but lets window content
-  leak through the corner instead, visible as a dark square on
-  GPU-accelerated clients like Ghostty and Zen Browser, so hypr-seam
-  doesn't do that. A real fix needs the cutout to use hypr-seam's live
-  per-corner radius, which means patching Hyprland's own
-  `renderRoundedShadow`; nothing reachable from plugin code controls it.
+  shadow stay native (square, if `decoration:rounding = 0`). With
+  `round_shadows` on the cutout follows the live radius except when
+  `decoration:shadow:sharp` is set or the window is untracked, where the
+  shadow stays native.
