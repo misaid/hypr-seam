@@ -1,7 +1,9 @@
-// tests/test_seamconfig.cpp
 #include "../src/SeamConfig.hpp"
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
+#include <optional>
+#include <string>
 #include <vector>
 
 static int failures = 0;
@@ -111,15 +113,13 @@ static void test_parse_trailing_garbage_fails() {
     CHECK(!parseSeamRuleLine("seam 1junk, class:^(foot)$", rule));
     CHECK(!parseSeamRuleLine("rounding 1 2 3 4 5, class:^(foot)$", rule));
     CHECK(!parseSeamRuleLine("seam 1, class:", rule)); // empty pattern
-    CHECK(!parseSeamRuleLine("seam 1, workspace:2", rule)); // unknown matcher
+    CHECK(!parseSeamRuleLine("seam 1, monitor:2", rule)); // unknown matcher
     CHECK(parseSeamRuleLine("seam 1 , class:^(foot)$ ", rule)); // surrounding whitespace is fine
     CHECK(rule.classPattern == "^(foot)$");
 }
 
-// Regression test for a latent UB hazard: bare `SSeamRule rule;` (no braces,
-// as used by onSeamRule() in main.cpp before parseSeamRuleLine fills it) must
-// deterministically default-initialize every scalar member via SSeamRule's
-// default member initializers, not leave bool/double fields indeterminate.
+// Regression: a bare `SSeamRule rule;` (as in onSeamRule()) must not leave scalar
+// members indeterminate.
 static void test_default_constructed_rule_has_safe_defaults() {
     SSeamRule rule;
     CHECK(rule.isSeamDirective == false);
@@ -132,9 +132,8 @@ static void test_default_constructed_rule_has_safe_defaults() {
     CHECK(rule.titlePattern.empty());
 }
 
-// Regression: a window's rule follows its current title. The plugin used to resolve
-// only on layout changes, so a window kept the rule it matched when it opened. These
-// resolves are what SeamState::recomputeWindow() runs on every title change.
+// Regression: rules follow the window's current title, as re-resolved by
+// SeamState::recomputeWindow() on every title change.
 static void test_rule_follows_title_changes() {
     SSeamRule rule{.isSeamDirective = false, .radii = {0, 0, 0, 0}, .titlePattern = "nvim"};
     const std::vector<SSeamRule> rules{rule};
@@ -166,6 +165,148 @@ static void test_malformed_pattern_skipped_every_time() {
     }
 }
 
+// --- Workspace matching ---------------------------------------------------------
+
+static WorkspaceSelector idSel(std::int64_t id) {
+    return SWorkspaceId{id};
+}
+
+static WorkspaceSelector nameSel(const char* name) {
+    return SWorkspaceName{name};
+}
+
+// A rule with only a workspace matcher applies to every window on that workspace and to
+// none elsewhere.
+static void test_workspace_only_rule_matches_that_workspace() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .workspaces = {idSel(2)}};
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {rule}, SWorkspaceRef{2, "2"}).seamEnabled == true);
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {rule}, SWorkspaceRef{1, "1"}).seamEnabled == false);
+}
+
+// A list of workspaces is an OR: any entry matching is enough.
+static void test_workspace_list_matches_any_entry() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .workspaces = {idSel(1), idSel(2), idSel(3)}};
+    for (std::int64_t id = 1; id <= 3; ++id)
+        CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{id, std::to_string(id)}).seamEnabled == true);
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{4, "4"}).seamEnabled == false);
+}
+
+// Matchers within one rule are an AND: workspace and class must both match.
+static void test_workspace_and_class_both_required() {
+    SSeamRule rule{.isSeamDirective = false, .radii = {0, 0, 0, 0}, .classPattern = "^kitty$", .workspaces = {idSel(2)}};
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {rule}, SWorkspaceRef{2, "2"}).radii.topLeft == 0);
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {rule}, SWorkspaceRef{1, "1"}).radii.topLeft == 22);
+    CHECK(resolveWindowConfig("foot", "", false, defaultDefaults(), {rule}, SWorkspaceRef{2, "2"}).radii.topLeft == 22);
+}
+
+// Order decides between a workspace rule and an app rule, in both directions.
+static void test_workspace_and_class_rules_resolve_by_order() {
+    SSeamRule wsRule{.isSeamDirective = false, .radii = {0, 0, 0, 0}, .workspaces = {idSel(2)}};
+    SSeamRule appRule{.isSeamDirective = false, .radii = {12, 12, 12, 12}, .classPattern = "^firefox$"};
+    const SWorkspaceRef ws2{2, "2"};
+    CHECK(resolveWindowConfig("firefox", "", false, defaultDefaults(), {wsRule, appRule}, ws2).radii.topLeft == 12);
+    CHECK(resolveWindowConfig("firefox", "", false, defaultDefaults(), {appRule, wsRule}, ws2).radii.topLeft == 0);
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {wsRule, appRule}, ws2).radii.topLeft == 0);
+}
+
+// A window with no workspace (std::nullopt) can never satisfy a workspace matcher.
+static void test_workspace_rule_never_matches_window_without_workspace() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .workspaces = {idSel(2)}};
+    CHECK(resolveWindowConfig("kitty", "", false, defaultDefaults(), {rule}).seamEnabled == false);
+}
+
+// Name selectors match by exact name, which is how named and special workspaces are
+// reached, since they have no numeric ID.
+static void test_workspace_name_selector() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .workspaces = {nameSel("web"), nameSel("special:scratch")}};
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{std::nullopt, "web"}).seamEnabled == true);
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{std::nullopt, "special:scratch"}).seamEnabled == true);
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{std::nullopt, "web2"}).seamEnabled == false);
+    // Named and special workspaces have no ID, so an ID selector cannot match them.
+    SSeamRule byId{.isSeamDirective = true, .seamOn = true, .workspaces = {idSel(2)}};
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {byId}, SWorkspaceRef{std::nullopt, "special:scratch"}).seamEnabled == false);
+}
+
+// Numbers (bare or as text) become IDs, everything else a name; `name:` is an optional
+// prefix. Empty selectors, numeric names and out-of-range IDs are rejected.
+static void test_parse_workspace_selector() {
+    CHECK(parseWorkspaceSelector("2") == idSel(2));
+    CHECK(parseWorkspaceSelector("0") == idSel(0));
+    CHECK(parseWorkspaceSelector("4294967295") == idSel(4294967295LL));
+    CHECK(parseWorkspaceSelector("web") == nameSel("web"));
+    CHECK(parseWorkspaceSelector("name:web") == nameSel("web"));
+    CHECK(!parseWorkspaceSelector("name:2")); // Hyprland forbids numeric workspace names
+    CHECK(parseWorkspaceSelector("special:scratch") == nameSel("special:scratch"));
+    CHECK(parseWorkspaceSelector("2b") == nameSel("2b"));
+    CHECK(!parseWorkspaceSelector(""));
+    CHECK(!parseWorkspaceSelector("name:"));
+    CHECK(!parseWorkspaceSelector("99999999999999999999999"));
+    CHECK(!parseWorkspaceSelector("-1"));         // IDs are unsigned; no workspace has a negative one
+    CHECK(!parseWorkspaceSelector("4294967296")); // one past the 32-bit limit
+}
+
+// Surrounding whitespace is ignored, including after `name:`, so " 2" is ID 2 rather
+// than a name no workspace can have.
+static void test_parse_workspace_selector_trims() {
+    CHECK(parseWorkspaceSelector(" 2") == idSel(2));
+    CHECK(parseWorkspaceSelector("2\t ") == idSel(2));
+    CHECK(parseWorkspaceSelector("  web ") == nameSel("web"));
+    CHECK(parseWorkspaceSelector("name: web") == nameSel("web"));
+    CHECK(parseWorkspaceSelector("my web") == nameSel("my web")); // inner spaces are kept
+    CHECK(!parseWorkspaceSelector("   "));
+    CHECK(!parseWorkspaceSelector("name:  "));
+}
+
+// A name selector matches either Hyprland's address or the label the user sees, so a
+// workspace renamed to "web" is reachable as "web". Numbered workspaces' addresses are
+// their ID as text, which no name selector can equal, so the two kinds never cross-match.
+static void test_workspace_name_matches_display_name() {
+    SSeamRule rule{.isSeamDirective = true, .seamOn = true, .workspaces = {nameSel("web")}};
+    const SWorkspaceRef renamed{.id = 2, .address = "2", .displayName = "web"};
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, renamed).seamEnabled == true);
+
+    SSeamRule byId{.isSeamDirective = true, .seamOn = true, .workspaces = {idSel(2)}};
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {byId}, renamed).seamEnabled == true);
+
+    const SWorkspaceRef other{.id = 3, .address = "3", .displayName = "mail"};
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, other).seamEnabled == false);
+}
+
+// The string form accepts a single `workspace:<selector>` matcher and resets the
+// matchers of a reused rule object.
+static void test_parse_workspace_rule_line() {
+    SSeamRule rule;
+    CHECK(parseSeamRuleLine("rounding 0 0 0 0, workspace:2", rule));
+    CHECK(!rule.isSeamDirective);
+    CHECK(rule.workspaces == std::vector{idSel(2)});
+    CHECK(rule.classPattern.empty() && rule.titlePattern.empty());
+
+    CHECK(parseSeamRuleLine("seam 1, workspace:name:web", rule));
+    CHECK(rule.workspaces == std::vector{nameSel("web")});
+
+    // A reused rule object must not carry the previous matcher over.
+    CHECK(parseSeamRuleLine("seam 0, class:^foot$", rule));
+    CHECK(rule.workspaces.empty() && rule.classPattern == "^foot$");
+
+    CHECK(!parseSeamRuleLine("seam 1, workspace:", rule));
+    CHECK(!parseSeamRuleLine("seam 1, workspace:name:", rule));
+
+    // The string form takes exactly one matcher, so anything after a comma is an error
+    // instead of becoming part of a name that can never match.
+    CHECK(!parseSeamRuleLine("seam 1, workspace:2, class:^kitty$", rule));
+    CHECK(!parseSeamRuleLine("seam 1, workspace:1,2", rule));
+    CHECK(parseSeamRuleLine("seam 1, workspace: 2", rule));
+    CHECK(rule.workspaces == std::vector{idSel(2)});
+}
+
+// A workspace-only rule counts as having a matcher, so it must neither be rejected as
+// matcher-less nor ignored by the resolver.
+static void test_workspace_rule_counts_as_matcher() {
+    SSeamRule rule;
+    CHECK(parseSeamRuleLine("seam 1, workspace:3", rule));
+    CHECK(resolveWindowConfig("x", "", false, defaultDefaults(), {rule}, SWorkspaceRef{3, "3"}).seamEnabled == true);
+}
+
 int main() {
     test_default_constructed_rule_has_safe_defaults();
     test_title_rule_matches_by_title_only();
@@ -184,6 +325,17 @@ int main() {
     test_rule_follows_title_changes();
     test_cached_pattern_keeps_matching();
     test_malformed_pattern_skipped_every_time();
+    test_workspace_only_rule_matches_that_workspace();
+    test_workspace_list_matches_any_entry();
+    test_workspace_and_class_both_required();
+    test_workspace_and_class_rules_resolve_by_order();
+    test_workspace_rule_never_matches_window_without_workspace();
+    test_workspace_name_selector();
+    test_parse_workspace_selector();
+    test_parse_workspace_selector_trims();
+    test_workspace_name_matches_display_name();
+    test_parse_workspace_rule_line();
+    test_workspace_rule_counts_as_matcher();
 
     if (failures == 0) {
         std::printf("All seam-config tests passed.\n");

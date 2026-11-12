@@ -16,7 +16,9 @@
 #include <lauxlib.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <array>
@@ -29,10 +31,7 @@
 #include "SeamDecorHook.hpp"
 
 namespace {
-    // Shared notification styling. kErrorColor is used for every hard failure (version
-    // mismatch, failed rule registration, malformed Lua rule). Init status toasts use
-    // kShortNotifyTimeoutMs; errors and diagnostics, which take longer to read, use
-    // kNotifyTimeoutMs.
+    // Notification styling: errors use kNotifyTimeoutMs, init status toasts the shorter one.
     const CHyprColor kErrorColor{1.0, 0.2, 0.2, 1.0};
     constexpr int     kNotifyTimeoutMs      = 8000;
     constexpr int     kShortNotifyTimeoutMs = 5000;
@@ -43,8 +42,7 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
 
-// Hyprlang keyword handler for `seamrule = ...` lines. Handlers are plain function
-// pointers with no captured state, so parsed rules are stashed in SeamRuleStore.
+// Hyprlang `seamrule = ...` handler. Handlers carry no state, so rules go to SeamRuleStore.
 static Hyprlang::CParseResult onSeamRule(const char* /*COMMAND*/, const char* VALUE) {
     Hyprlang::CParseResult result;
     SSeamRule              rule;
@@ -56,14 +54,11 @@ static Hyprlang::CParseResult onSeamRule(const char* /*COMMAND*/, const char* VA
 }
 
 namespace {
-    // Every event-bus listener handle the plugin owns. They live at namespace scope so
-    // PLUGIN_EXIT can drop them. A listener is unregistered when its handle is destroyed,
-    // and a function-local static in PLUGIN_INIT would only be destroyed at DSO teardown,
-    // which may happen late or never, leaving callbacks into plugin state after unload.
+    // Listener handles, kept at namespace scope so PLUGIN_EXIT can drop them. A function-local
+    // static would only die at DSO teardown, leaving callbacks into an unloaded plugin.
     std::vector<Hyprutils::Signal::CHyprSignalListener> g_listeners;
 
-    // Reads one rule-table field as a regex pattern string. Returns false (with `err` set)
-    // if present but not a string.
+    // Reads an optional regex field. Returns false (with `err` set) if present but not a string.
     bool luaOptionalString(lua_State* L, int tableIdx, const char* field, std::string& out, std::string& err) {
         lua_getfield(L, tableIdx, field);
         bool ok = true;
@@ -77,16 +72,68 @@ namespace {
         return ok;
     }
 
+    // Appends the selector on top of the Lua stack. Numbers are read as numbers, not via
+    // lua_tostring, which would turn 2.0 into the name "2.0". Returns false with `err` set.
+    bool luaWorkspaceSelector(lua_State* L, std::vector<WorkspaceSelector>& out, std::string& err) {
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            // Range-checked before the cast so the conversion is defined.
+            const lua_Number n = lua_tonumber(L, -1);
+            if (n != std::floor(n) || n < 0 || n > static_cast<lua_Number>(kMaxWorkspaceId)) {
+                err = "'workspace' numbers must be whole workspace IDs (0 or higher)";
+                return false;
+            }
+            out.emplace_back(SWorkspaceId{static_cast<std::int64_t>(n)});
+            return true;
+        }
+
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            auto selector = parseWorkspaceSelector(lua_tostring(L, -1));
+            if (!selector) {
+                err = "'workspace' is empty, a numeric name, or an out-of-range ID";
+                return false;
+            }
+            out.push_back(std::move(*selector));
+            return true;
+        }
+
+        err = "'workspace' must be a workspace ID, a name, or a list of those";
+        return false;
+    }
+
+    // Reads the optional `workspace` field: one selector or a non-empty list. Absent = any workspace.
+    bool luaOptionalWorkspaces(lua_State* L, int tableIdx, std::vector<WorkspaceSelector>& out, std::string& err) {
+        lua_getfield(L, tableIdx, "workspace");
+        bool ok = true;
+
+        if (lua_type(L, -1) == LUA_TTABLE) {
+            const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
+            if (count == 0) {
+                err = "'workspace' list must not be empty";
+                ok  = false;
+            }
+            for (lua_Integer i = 1; ok && i <= count; ++i) {
+                lua_rawgeti(L, -1, i);
+                ok = luaWorkspaceSelector(L, out, err);
+                lua_pop(L, 1);
+            }
+        } else if (!lua_isnil(L, -1))
+            ok = luaWorkspaceSelector(L, out, err);
+
+        lua_pop(L, 1);
+        return ok;
+    }
+
     // Parses the table form of hl.plugin.seam.rule:
-    //   { class = "<regex>", title = "<regex>", seam = <bool|0|1>, rounding = <n | {tl, tr, bl, br}> }
-    // Needs class and/or title, and seam and/or rounding. Each directive becomes its own
-    // rule, so a table with both seam and rounding produces two rules.
+    //   { class = <regex>, title = <regex>, workspace = <id | name | {...}>,
+    //     seam = <bool|0|1>, rounding = <n | {tl, tr, bl, br}> }
+    // Needs at least one matcher and at least one directive. Each directive becomes its own rule.
     bool parseLuaRuleTable(lua_State* L, int idx, std::vector<SSeamRule>& out, std::string& err) {
         SSeamRule base{};
-        if (!luaOptionalString(L, idx, "class", base.classPattern, err) || !luaOptionalString(L, idx, "title", base.titlePattern, err))
+        if (!luaOptionalString(L, idx, "class", base.classPattern, err) || !luaOptionalString(L, idx, "title", base.titlePattern, err) ||
+            !luaOptionalWorkspaces(L, idx, base.workspaces, err))
             return false;
-        if (base.classPattern.empty() && base.titlePattern.empty()) {
-            err = "needs a non-empty 'class' and/or 'title' regex";
+        if (base.classPattern.empty() && base.titlePattern.empty() && base.workspaces.empty()) {
+            err = "needs a non-empty 'class' and/or 'title' regex, and/or a 'workspace'";
             return false;
         }
 
@@ -148,16 +195,14 @@ namespace {
         return true;
     }
 
-    // Per-app rules for Lua configs, registered as hl.plugin.seam.rule. Takes the same
-    // string as a hyprlang `seamrule = ...` line, or a table:
+    // hl.plugin.seam.rule: takes a rule string or a table.
     //   hl.plugin.seam.rule("seam 0, class:^(foot)$")
-    //   hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
-    //   hl.plugin.seam.rule({ title = "^Picture-in-Picture$", seam = false })
+    //   hl.plugin.seam.rule({ workspace = { 1, 2, 3 }, seam = true })
+    //   hl.plugin.seam.rule({ workspace = 2, class = "^(kitty)$", rounding = 0 })
+    // Last matching rule wins, whatever it matched on.
     //
-    // Errors go to the config error list and show in the error bar, the same way
-    // Hyprland's own Lua bindings report them. Raising a Lua error would abort the rest of
-    // the user's config, and lua_error longjmps, which must never cross live C++ objects
-    // with destructors.
+    // Errors go to the config error list instead of lua_error: raising would abort the rest of
+    // the config, and lua_error longjmps across C++ destructors.
     int luaSeamRule(lua_State* L) {
         std::string            err;
         std::vector<SSeamRule> parsed;
@@ -167,7 +212,7 @@ namespace {
             if (parseSeamRuleLine(lua_tostring(L, 1), rule))
                 parsed.push_back(rule);
             else
-                err = "malformed rule string (expected e.g. \"seam 0, class:^(foot)$\" or \"rounding 4 4 22 22, title:^(x)$\")";
+                err = "malformed rule string (expected e.g. \"seam 0, class:^(foot)$\", \"rounding 4 4 22 22, title:^(x)$\" or \"seam 1, workspace:2\")";
         } else if (lua_type(L, 1) == LUA_TTABLE)
             parseLuaRuleTable(L, 1, parsed, err);
         else
@@ -190,12 +235,9 @@ namespace {
         return 0;
     }
 
-    // Lua version of the `seam:debugstate` dispatcher, registered as
-    // hl.plugin.seam.debugstate. Under a Lua config, `hyprctl dispatch` becomes
-    // `hl.dispatch(<lua expr>)` and can't reach dispatchers added with addDispatcherV2,
-    // so use this instead:
+    // hl.plugin.seam.debugstate: Lua replacement for the `seam:debugstate` dispatcher, which
+    // Lua configs can't reach. Returns and logs the dump:
     //   hyprctl eval 'return hl.plugin.seam.debugstate()'
-    // Returns the dump as a string and logs it, like the dispatcher.
     int luaSeamDebugState(lua_State* L) {
         {
             const auto dump = SeamState::debugDump();
@@ -240,14 +282,11 @@ static void registerSeamConfig() {
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.roundBorders);
     HyprlandAPI::addConfigValueV2(PHANDLE, vars.roundShadows);
 
-    // Per-app rules have one entry point per config format. Both are registered, but
-    // each only succeeds under its own config manager: per the 0.56.2 PluginAPI.cpp,
-    // addConfigKeyword fails unless Hyprland runs a hyprlang .conf, and addLuaFunction
-    // fails unless it runs a Lua config. Notify only if the one for the active config
-    // manager failed.
+    // Both rule entry points are registered, but each only succeeds under its own config
+    // manager (keyword: hyprlang, function: Lua). Only the active one's failure is reported.
     const bool keywordOk = HyprlandAPI::addConfigKeyword(PHANDLE, "seamrule", onSeamRule, Hyprlang::SHandlerOptions{});
     const bool luaOk     = HyprlandAPI::addLuaFunction(PHANDLE, "seam", "rule", luaSeamRule);
-    // Diagnostic only, so no notification on failure. The dispatcher still works.
+    // Diagnostic only; failure is not reported.
     HyprlandAPI::addLuaFunction(PHANDLE, "seam", "debugstate", luaSeamDebugState);
 
     const bool isLua = Config::mgr() && Config::mgr()->type() == Config::CONFIG_LUA;
@@ -261,13 +300,9 @@ static void registerSeamConfig() {
     HyprlandAPI::reloadConfig();
 }
 
-// With plugin:seam:tolerance at its default (-1), the tolerance comes from general:gaps_in,
-// so tiled windows at the layout's normal spacing count as touching without any tuning.
-// The real gap between two dwindle/master siblings is wider than gaps_in (border_size adds
-// to it, and there's no documented formula), so the estimate is generous. Measured gaps of
-// 12-26px, with gaps_in of 4-10px and border_size of 2-3px, all fall inside 3x+6. Too wide a
-// tolerance only matters with a tiny seam_radius and a large intentional gap, and anyone who
-// wants that can set plugin:seam:tolerance explicitly, which skips this.
+// Default tolerance (plugin:seam:tolerance = -1), derived from general:gaps_in. Real sibling
+// gaps are wider than gaps_in because borders add to them; measured 12-26px gaps all fall
+// inside 3x+6. Set plugin:seam:tolerance explicitly to override.
 static double resolveTolerance() {
     const Config::INTEGER val = vars.tolerance->value();
     if (val >= 0)
@@ -282,8 +317,7 @@ static double resolveTolerance() {
     return std::max<double>(8.0, static_cast<double>(maxGap) * 3.0 + 6.0);
 }
 
-// Builds the resolved global seam defaults from the live plugin:seam:* config values.
-// Declared in globals.hpp.
+// Resolves the global seam defaults from live plugin:seam:* values (declared in globals.hpp).
 SGlobalSeamDefaults currentGlobalDefaults() {
     const double base = static_cast<double>(vars.rounding->value());
 
@@ -307,8 +341,7 @@ SGlobalSeamDefaults currentGlobalDefaults() {
     };
 }
 
-// Warns if decoration:rounding isn't 0. The plugin replaces native corner rounding,
-// and the two conflict on screen.
+// Warns if decoration:rounding isn't 0; native rounding conflicts with the plugin's.
 static void checkNativeRoundingIsZero() {
     static auto PROUNDING = CConfigValue<Config::INTEGER>("decoration:rounding");
     if (*PROUNDING != 0) {
@@ -318,52 +351,43 @@ static void checkNativeRoundingIsZero() {
     }
 }
 
-// On every config reload, hyprlang calls the `seamrule` handler again for each rule (a Lua
-// config re-runs its hl.plugin.seam.rule calls), but never clears SeamRuleStore. Without
-// the preReload clear, reloaded rules would pile up on top of the old ones. Both config
-// managers emit preReload before re-running the config. The rounding check runs on
-// reloaded, after the new values are in.
+// Registers config and window listeners.
 //
-// Also registers the window-tracking and adjacency-recompute triggers. Hyprland has no
-// window move/resize event and none for a `hyprctl keyword` change, so both are caught
-// on `tick`, behind a cheap dirty check (SeamState::onTick()) that keeps idle ticks
-// nearly free. `tick` only fires while something animates, so a keyword change on an
-// idle desktop waits for the next animation.
+// Rules are cleared on preReload because a reload re-runs every rule registration without
+// clearing the store. Hyprland has no move/resize or `hyprctl keyword` event, so those are
+// caught on `tick` behind SeamState::onTick()'s dirty check; `tick` only fires while
+// something animates.
 static void registerEventListeners() {
     g_listeners.emplace_back(Event::bus()->m_events.config.preReload.listen([]() { SeamRuleStore::clear(); }));
-    // Recompute on a full config reload, such as `hyprctl reload` after editing rules,
-    // radii or plugin:seam:enabled. Otherwise corners stay stale until some unrelated
-    // geometry, workspace or monitor event fires.
+    // A full reload can change rules, radii or enabled; recompute instead of waiting for an event.
     g_listeners.emplace_back(Event::bus()->m_events.config.reloaded.listen([]() {
         checkNativeRoundingIsZero();
         SeamState::recomputeAll();
     }));
-    // EventBus.hpp doesn't document when config.props_refreshed fires. This listener is
-    // a cheap extra in case some config change fires it without a full reload. Tested:
-    // `hyprctl keyword plugin:seam:... <value>` does not fire it; SeamState::onTick()
-    // picks that change up instead.
+    // Cheap extra in case a config change fires props_refreshed without a full reload.
+    // `hyprctl keyword` does not fire it; onTick() covers that.
     g_listeners.emplace_back(Event::bus()->m_events.config.props_refreshed.listen([](const bool) { SeamState::recomputeAll(); }));
 
     g_listeners.emplace_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { SeamState::onWindowOpened(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { SeamState::onWindowClosed(w); }));
-    // A new title or class can make a different seamrule match. These apply it right
-    // away instead of at the window's next layout change.
+    // A new title or class can change which rules match.
     g_listeners.emplace_back(Event::bus()->m_events.window.title.listen([](PHLWINDOW w) { SeamState::recomputeWindow(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.class_.listen([](PHLWINDOW w) { SeamState::recomputeWindow(w); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.fullscreen.listen([](PHLWINDOW) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.window.moveToWorkspace.listen([](PHLWINDOW, PHLWORKSPACE) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.workspace.active.listen([](PHLWORKSPACE) { SeamState::recomputeAll(); }));
+    // Name selectors also match the display name, which a rename changes without any
+    // geometry change for onTick() to notice.
+    g_listeners.emplace_back(Event::bus()->m_events.workspace.renamed.listen([](PHLWORKSPACEREF) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR) { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.monitor.layoutChanged.listen([]() { SeamState::recomputeAll(); }));
     g_listeners.emplace_back(Event::bus()->m_events.tick.listen([]() { SeamState::onTick(); }));
 }
 
-// Tracks every window already open at load time, since the plugin can be loaded into
-// a running session. Hidden windows (such as inactive members of a group) are included:
-// they don't fire window.open when shown again, so skipping them would leave them
-// untracked and square until reopened.
+// Tracks windows already open at load time. Hidden windows (inactive group members) are
+// included, since they fire no window.open when shown again.
 static void attachExistingWindows() {
     for (auto& w : Desktop::windowState()->windows()) {
         if (!validMapped(w))
@@ -372,9 +396,8 @@ static void attachExistingWindows() {
     }
 }
 
-// `hyprctl dispatch seam:debugstate` shows a notification, and writes the same text to
-// hyprland.log, listing every tracked window's live corner radii. '*' marks corners
-// flagged as touching a neighbor. The render path doesn't use it; it's for bug reports.
+// `hyprctl dispatch seam:debugstate`: shows and logs every tracked window's live radii,
+// with '*' on corners flagged as touching. For bug reports.
 static void registerDebugDispatcher() {
     HyprlandAPI::addDispatcherV2(PHANDLE, "seam:debugstate", [](std::string) -> SDispatchResult {
         const auto dump = SeamState::debugDump();
@@ -402,9 +425,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     attachExistingWindows();
     registerDebugDispatcher();
 
-    // Per-corner rendering hook on Render::IElementRenderer::drawSurface (SeamHook.cpp).
-    // If install() fails it has already shown a notification, and the plugin stays
-    // loaded without rendering anything.
+    // Per-corner surface rounding (SeamHook.cpp). On failure install() has already notified,
+    // and the plugin stays loaded without rendering.
     SeamHook::install();
     SeamDecorHook::install();
 
@@ -414,11 +436,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    // Order matters: remove the render hooks, then drop the event listeners so nothing
-    // calls back into SeamState, then release tracked windows and their animated
-    // variables, then the parsed rules. Hyprland unregisters hl.plugin.seam.rule, the
-    // seamrule keyword, the dispatcher and the plugin:seam:* values on unload
-    // (PluginSystem / onPluginUnload).
+    // Order matters: hooks first, then listeners so nothing calls into SeamState, then tracked
+    // windows, then rules. Hyprland unregisters the plugin's functions, keyword, dispatcher
+    // and config values itself.
     SeamDecorHook::remove();
     SeamHook::remove();
     g_listeners.clear();

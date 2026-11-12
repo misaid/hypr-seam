@@ -12,75 +12,75 @@
 -- will double up with (or fight) hypr-seam's own rounding.
 
 hl.config({
-    plugin = {
-        seam = {
-            -- Uniform base corner radius used for any corner that doesn't
-            -- have its own rounding_* override below. This is the radius
-            -- windows render at when the seam effect isn't flattening them.
-            rounding = 22,
+	plugin = {
+		seam = {
+			-- Uniform base corner radius used for any corner that doesn't
+			-- have its own rounding_* override below. This is the radius
+			-- windows render at when the seam effect isn't flattening them.
+			rounding = 22,
 
-            -- Per-corner base radius overrides. Each one falls back to
-            -- `rounding` above when left unset, so you only need to set the
-            -- corners you want to differ. Commented out here since "unset"
-            -- has no literal Lua value — uncomment and set a number to
-            -- override a specific corner.
-            -- rounding_topleft = 22,
-            -- rounding_topright = 22,
-            -- rounding_bottomleft = 22,
-            -- rounding_bottomright = 22,
+			-- Per-corner base radius overrides. Each one falls back to
+			-- `rounding` above when left unset, so you only need to set the
+			-- corners you want to differ. Commented out here since "unset"
+			-- has no literal Lua value — uncomment and set a number to
+			-- override a specific corner.
+			-- rounding_topleft = 22,
+			-- rounding_topright = 22,
+			-- rounding_bottomleft = 22,
+			-- rounding_bottomright = 22,
 
-            -- Squircle exponent for the corner curve shape. 2.0 matches a
-            -- regular rounded-rectangle curve (Hyprland's native look).
-            -- Raise it for a more squared-off "squircle" corner.
-            rounding_power = 2.0,
+			-- Squircle exponent for the corner curve shape. 2.0 matches a
+			-- regular rounded-rectangle curve (Hyprland's native look).
+			-- Raise it for a more squared-off "squircle" corner.
+			rounding_power = 2.0,
 
-            -- Global master switch for the seam effect. When false, windows
-            -- just render with ordinary per-corner rounding and nothing
-            -- ever flattens, regardless of adjacency.
-            enabled = false,
+			-- Global master switch for the seam effect. When false, windows
+			-- just render with ordinary per-corner rounding and nothing
+			-- ever flattens, regardless of adjacency.
+			enabled = false,
 
-            -- Radius a corner collapses to once it's flagged as touching a
-            -- neighboring tiled window (a book-seam corner instead of a
-            -- fully rounded one).
-            seam_radius = 2,
+			-- Radius a corner collapses to once it's flagged as touching a
+			-- neighboring tiled window (a book-seam corner instead of a
+			-- fully rounded one).
+			seam_radius = 2,
 
-            -- Maximum gap, in pixels, between two window edges that still
-            -- counts as "touching" for seam purposes. -1 (the default)
-            -- derives this from general.gaps_in automatically; set an
-            -- explicit value only if the auto default doesn't match your
-            -- layout.
-            tolerance = -1,
+			-- Maximum gap, in pixels, between two window edges that still
+			-- counts as "touching" for seam purposes. -1 (the default)
+			-- derives this from general.gaps_in automatically; set an
+			-- explicit value only if the auto default doesn't match your
+			-- layout.
+			tolerance = -1,
 
-            -- Eases a corner's radius between its base and seam values
-            -- instead of snapping instantly when adjacency changes.
-            animate = true,
+			-- Eases a corner's radius between its base and seam values
+			-- instead of snapping instantly when adjacency changes.
+			animate = true,
 
-            -- Duration, in milliseconds, of that easing transition.
-            animation_speed = 300,
+			-- Duration, in milliseconds, of that easing transition.
+			animation_speed = 300,
 
-            -- Name of a bezier curve already registered via hl.curve(...)
-            -- to drive the easing above. "default" is Hyprland's built-in
-            -- curve.
-            animation_curve = "default",
+			-- Name of a bezier curve already registered via hl.curve(...)
+			-- to drive the easing above. "default" is Hyprland's built-in
+			-- curve.
+			animation_curve = "default",
 
-            -- Also round a window's subsurfaces where they reach the
-            -- window's own corners. Turn this on if Firefox-based browsers
-            -- (Firefox, Zen, ...) keep square corners: they draw the whole
-            -- window into a subsurface that hides the rounded main surface.
-            -- Off by default because it affects how every app's
-            -- subsurfaces are drawn.
-            force_round_risky_surfaces = false,
+			-- Also round a window's subsurfaces where they reach the
+			-- window's own corners. Turn this on if Firefox-based browsers
+			-- (Firefox, Zen, ...) keep square corners: they draw the whole
+			-- window into a subsurface that hides the rounded main surface.
+			-- Off by default because it affects how every app's
+			-- subsurfaces are drawn.
+			force_round_risky_surfaces = false,
 
-            -- Off by default. Round the native border to match this
-            -- window's live corner radii (including seam flattening).
-            -- Only visible with general.border_size > 0.
-            round_borders = false,
+			-- Off by default. Round the native border to match this
+			-- window's live corner radii (including seam flattening).
+			-- Only visible with general.border_size > 0.
+			round_borders = false,
 
-            -- Off by default. Round the native drop shadow the same way.
-            -- Only visible with decoration.shadow.enabled = true.
-            round_shadows = false,
-        },
-    },
+			-- Off by default. Round the native drop shadow the same way.
+			-- Only visible with decoration.shadow.enabled = true.
+			round_shadows = false,
+		},
+	},
 })
 
 -- Per-app rules (hl.plugin.seam.rule)
@@ -103,3 +103,20 @@ hl.plugin.seam.rule({ class = "^(kitty)$", rounding = { 4, 4, 22, 22 } })
 -- floating-like windows such as a picture-in-picture player that shouldn't
 -- visually merge with whatever tiled window it happens to sit next to.
 hl.plugin.seam.rule({ title = "^Picture-in-Picture$", seam = false })
+
+-- Per-workspace rules. `workspace` takes a workspace ID, a name, or a list of
+-- them, and combines with class/title: a rule applies only where every
+-- matcher it names matches. A number (or a string of digits) is an ID; any
+-- other string is a name, matched against the workspace's address or its
+-- renamed label. Named and special workspaces have no ID, so use their name
+-- ("web", "special:<name>"). As with every rule, the one written last wins.
+
+-- Seam on workspaces 1, 2 and 3 only (leave `enabled = false` above).
+hl.plugin.seam.rule({ workspace = { 1, 2, 3 }, seam = true })
+
+-- No rounding on workspace 2.
+hl.plugin.seam.rule({ workspace = 2, rounding = 0 })
+
+-- An app rule written after a workspace rule wins: Firefox stays rounded
+-- on workspace 2.
+hl.plugin.seam.rule({ class = "^(firefox)$", rounding = 12 })

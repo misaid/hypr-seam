@@ -127,11 +127,11 @@ All values live under the `plugin:seam:` prefix.
 | `plugin:seam:round_borders` | bool | `false` | Round the native border to match the window's live corner radii, seam flattening included. Needs `general:border_size > 0`. |
 | `plugin:seam:round_shadows` | bool | `false` | Round the native drop shadow to match the window's live corner radii, seam flattening included. Needs `decoration:shadow:enabled = true`. |
 
-Base corner radii resolve per window: a matching `seamrule rounding`
-override, or else the four global `rounding_*` values. The seam flag
-resolves the same way, via `seamrule seam` or else `plugin:seam:enabled`.
-Floating windows always skip seam resolution and render with base
-rounding only.
+Base corner radii resolve per window: the last matching `rounding` rule
+(per-app or per-workspace), or else the four global `rounding_*` values.
+The seam flag resolves the same way, via the last matching `seam` rule or
+else `plugin:seam:enabled`. Floating windows always skip seam resolution
+and render with base rounding only.
 
 ### Per-app rules (`hl.plugin.seam.rule`)
 
@@ -143,6 +143,9 @@ parses its own rules via `hl.plugin.seam.rule(...)`, using the same
 rounding <tl> <tr> <bl> <br>, <match>
 seam <0|1>, <match>
 ```
+
+where `<match>` is one of `class:<regex>`, `title:<regex>` or
+`workspace:<id or name>` (see [Per-workspace rules](#per-workspace-rules)).
 
 or an equivalent table. Examples:
 
@@ -165,6 +168,58 @@ both apply. Later rules win on conflict, same as `windowrulev2`.
 A malformed rule, in either form, shows up as a config error with a
 file/line reference, the same way Hyprland reports its own config
 mistakes.
+
+### Per-workspace rules
+
+A rule can also match on the workspace a window is on, with `workspace`.
+It takes a workspace ID, a workspace name, or a list of them, and combines
+with `class` and `title`: a rule applies only where every matcher it names
+matches.
+
+```lua
+-- seam on workspaces 1, 2 and 3 only
+hl.plugin.seam.rule({ workspace = { 1, 2, 3 }, seam = true })
+
+-- square corners on workspace 4 only
+hl.plugin.seam.rule({ workspace = 4, rounding = 0 })
+
+-- two rules on one workspace: mail windows on workspace 5 get diagonal
+-- "folded" corners, but compose windows there get a plain radius, because
+-- that rule comes later
+hl.plugin.seam.rule({ workspace = 5, rounding = { 22, 4, 4, 22 } })
+hl.plugin.seam.rule({ workspace = 5, title = "^Write:", rounding = 12 })
+
+-- named and special workspaces
+hl.plugin.seam.rule({ workspace = { "web", "special:scratch" }, seam = true })
+
+-- string form takes a single selector
+hl.plugin.seam.rule("rounding 0 0 0 0, workspace:2")
+```
+
+A number, or a string of digits such as `"2"`, is a workspace ID. Any other
+string is a workspace name, optionally written with Hyprland's `name:`
+prefix, and surrounding spaces are ignored. A name matches either the
+workspace's address or the label it was renamed to, so a workspace 2
+renamed to "web" matches both `2` and `"web"`. Named and special workspaces
+have no ID, so match them by name (`web`, `special:<name>`).
+
+The string form takes exactly one matcher: `"seam 1, workspace:2, class:x"`
+is an error. Use the table form to combine matchers or list workspaces.
+
+An app rule and a workspace rule resolve by order, like any two rules: the
+one written later wins. With the rules below, Firefox on workspace 2 is
+rounded to 12, because its rule comes last. Swap the two lines and it is
+square.
+
+```lua
+hl.plugin.seam.rule({ workspace = 2, rounding = 0 })
+hl.plugin.seam.rule({ class = "^(firefox)$", rounding = 12 })
+```
+
+Rules follow the window: moving it to another workspace, or renaming the
+workspace, re-resolves them. A window sent to a workspace that isn't on
+screen picks up that workspace's rules when the workspace is shown, so it
+may animate to its new corners as you switch to it.
 
 ## Scope and limitations
 
